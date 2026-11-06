@@ -1,0 +1,8 @@
+# Local scratch files, backups, extracted coursework and generated test results
+/work/
+/preview.png
+
+# Generated caches and editor backup files
+__pycache__/
+*.pyc
+*~

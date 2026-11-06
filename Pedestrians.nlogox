@@ -1,0 +1,389 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[; Implementation of equations (1)-(9), with a seeded random force per person.
+; Coordinates: metres. Velocity: m/s. Acceleration: m/s^2.
+; Interface variables: population, dt, desired-speed, noise-strength, noise-seed.
+
+breed [pedestrians pedestrian]
+
+globals [
+  tau anticipation-time potential-strength sigma
+  wall-strength wall-range view-half-angle rear-weight
+  epsilon arrival-radius wall-segments elapsed-seconds arrived-count
+]
+
+pedestrians-own [
+  goal-x goal-y                 ; destination x_i^0
+  ex ey                         ; desired unit direction e_i
+  wx wy                         ; preferred velocity w_i (kept between steps)
+  vx vy                         ; actual, speed-limited velocity v_i
+  ax ay                         ; acceleration dw_i/dt
+  noise-unit-x noise-unit-y     ; random unit direction, sampled once at setup
+  next-wx next-wy next-vx next-vy next-x next-y
+  reached-goal?
+]
+
+to setup
+  clear-all
+  resize-world 0 30 0 12
+  set-topology false false
+
+  ; Example settings for quantities left unspecified in the report.
+  set tau 0.5
+  set anticipation-time 0.5     ; T, independent of numerical step dt
+  set potential-strength 2.1   ; V^0, units m^2/s^2
+  set sigma 0.3                ; interaction range, metres
+  set view-half-angle 100      ; phi; NetLogo trigonometry uses degrees
+  set rear-weight 0.5          ; c
+  set epsilon 0.000001         ; length softening at singular geometries
+  set arrival-radius 0.3       ; metres
+
+  ; Equation (4): values explicitly given in your report.
+  set wall-strength 50
+  set wall-range 0.2
+  ; Every wall is [x1 y1 x2 y2]. Corridor is open at both ends.
+  ; Grey patches end at y=1.5 and begin at y=10.5.
+  set wall-segments [[0 1.5 30 1.5] [0 10.5 30 10.5]]
+  ask patches [
+    set pcolor white
+    if pycor <= 1 or pycor >= 11 [set pcolor gray - 2]
+    if (pxcor = 1 or pxcor = 29) and pycor > 1 and pycor < 11
+      [set pcolor green + 3]
+  ]
+
+  create-pedestrians population [
+    set shape "circle"
+    set size 0.4               ; drawing only; no radius in the equations
+    let group-index floor (who / 2)
+    let lane-count min (list 4 (population / 2))
+    let row-index group-index mod lane-count
+    let column-index floor (group-index / lane-count)
+    let lane-y 6 + 2 * (row-index - (lane-count - 1) / 2)
+    ; Opposing pairs have exactly the same y coordinate and goal-y.
+    ; There is no starting offset; the random force can break this symmetry.
+    ifelse who mod 2 = 0 [
+      setxy (10 - 1.5 * column-index) lane-y
+      set goal-x 29
+      set color orange + 1
+      set heading 90
+    ] [
+      setxy (20 + 1.5 * column-index) lane-y
+      set goal-x 1
+      set color blue
+      set heading 270
+    ]
+    set goal-y ycor
+    set reached-goal? false
+    set pen-size 1
+    pen-down                   ; leave trails to show the resulting paths
+    ; All velocity components initially equal zero.
+  ]
+  ; The report's f_i^r is assigned once, not resampled every tick.
+  ; Seed just this sampling step to make it independent of setup's ask order.
+  random-seed noise-seed
+  foreach sort pedestrians [p -> ask p [
+    let noise-angle random-float 360
+    set noise-unit-x cos noise-angle
+    set noise-unit-y sin noise-angle
+  ]]
+  ask pedestrians [update-desired-direction]
+  reset-ticks
+end
+
+to go
+  if not any? pedestrians [stop]
+  if dt <= 0 or tau <= 0 or sigma <= 0 or wall-range <= 0
+    [error "dt, tau, sigma and wall-range must be positive."]
+
+  ; Four separate passes ensure everyone uses the same time-t state.
+  ; Ordered passes also avoid introducing random ask order.
+  foreach sort pedestrians [p -> ask p [update-desired-direction]]
+  foreach sort pedestrians [p -> ask p [calculate-acceleration]]
+  foreach sort pedestrians [p -> ask p [calculate-next-state]]
+  foreach sort pedestrians [p -> ask p [commit-next-state]]
+  set elapsed-seconds elapsed-seconds + dt
+  tick                        ; one tick = one integration step
+end
+
+; Equation (1).
+to update-desired-direction
+  let delta-x goal-x - xcor
+  let delta-y goal-y - ycor
+  let distance-to-goal vector-length delta-x delta-y
+  ifelse distance-to-goal > epsilon [
+    set ex delta-x / distance-to-goal
+    set ey delta-y / distance-to-goal
+  ] [
+    set ex 0
+    set ey 0
+  ]
+end
+
+; Equations (2), (4), (5), (6).
+to calculate-acceleration
+  set ax (desired-speed * ex - vx) / tau
+  set ay (desired-speed * ey - vy) / tau
+
+  foreach sort other pedestrians [other-person ->
+    let force pair-force other-person
+    let fx item 0 force
+    let fy item 1 force
+    let magnitude vector-length fx fy
+    let weight rear-weight
+    ; Equation (5) uses MINUS the force in its dot product.
+    if ex * (- fx) + ey * (- fy) >= magnitude * cos view-half-angle
+      [set weight 1]
+    set ax ax + weight * fx
+    set ay ay + weight * fy
+  ]
+
+  foreach wall-segments [wall ->
+    let force wall-force wall
+    set ax ax + item 0 force
+    set ay ay + item 1 force
+  ]
+  ; Equation (6): constant random force while noise-strength is held fixed.
+  ; Strength is acceleration (m/s^2), not a displacement applied each tick.
+  set ax ax + noise-strength * noise-unit-x
+  set ay ay + noise-strength * noise-unit-y
+end
+
+; Equation (3), using its analytic negative gradient.
+to-report pair-force [other-person]
+  let qx xcor - [xcor] of other-person
+  let qy ycor - [ycor] of other-person
+  let other-speed vector-length ([vx] of other-person) ([vy] of other-person)
+  ; s_j uses ACTUAL speed and DESIRED direction, exactly as in the PDF.
+  let sx other-speed * anticipation-time * [ex] of other-person
+  let sy other-speed * anticipation-time * [ey] of other-person
+  report elliptical-force qx qy sx sy
+end
+
+to-report elliptical-force [qx qy sx sy]
+  let rx qx - sx
+  let ry qy - sy
+  ; Softened lengths prevent division by zero at the ellipse's foci.
+  ; Away from singularities the change is negligible (epsilon = 1e-6 m).
+  let r1 sqrt (qx * qx + qy * qy + epsilon * epsilon)
+  let r2 sqrt (rx * rx + ry * ry + epsilon * epsilon)
+  let total-distance r1 + r2
+  let b 0.5 * sqrt (max (list (4 * epsilon * epsilon)
+    (total-distance * total-distance - sx * sx - sy * sy)))
+  let scale (potential-strength / sigma) * exp (- b / sigma)
+    * total-distance / (4 * b)
+  report (list (scale * (qx / r1 + rx / r2))
+               (scale * (qy / r1 + ry / r2)))
+end
+
+; Equation (4), for the nearest point on a finite wall segment.
+to-report wall-force [wall]
+  let nearest nearest-point-on-segment xcor ycor wall
+  let delta-x xcor - item 0 nearest
+  let delta-y ycor - item 1 nearest
+  let d vector-length delta-x delta-y
+  ; The outward direction is undefined exactly on a zero-thickness wall.
+  if d < epsilon [error "Pedestrian is exactly on a wall. Check its position or reduce dt."]
+  let strength wall-strength * exp (- d / wall-range)
+  report (list (strength * delta-x / d) (strength * delta-y / d))
+end
+
+; Equations (7), (8), (9). Write buffers, not the current state.
+to calculate-next-state
+  set next-wx wx + dt * ax
+  set next-wy wy + dt * ay
+  let preferred-speed vector-length next-wx next-wy
+  let speed-factor 1
+  if preferred-speed > 0 [
+    set speed-factor min (list 1 (1.3 * desired-speed / preferred-speed))
+  ]
+  set next-vx next-wx * speed-factor
+  set next-vy next-wy * speed-factor
+  set next-x xcor + dt * next-vx
+  set next-y ycor + dt * next-vy
+
+  ; Arrive if this step's path enters the goal disk, even if it overshoots.
+  let path (list xcor ycor next-x next-y)
+  let closest nearest-point-on-segment goal-x goal-y path
+  set reached-goal? (vector-length (goal-x - item 0 closest)
+                                    (goal-y - item 1 closest)) <= arrival-radius
+  if not reached-goal? [
+    if next-x <= min-pxcor - 0.5 or next-x >= max-pxcor + 0.5 or
+       next-y <= min-pycor - 0.5 or next-y >= max-pycor + 0.5 [
+      error "A step would leave the world. Reduce dt or review forces and destinations."
+    ]
+  ]
+end
+
+to commit-next-state
+  if reached-goal? [
+    set arrived-count arrived-count + 1
+    die
+  ]
+  set wx next-wx
+  set wy next-wy
+  set vx next-vx
+  set vy next-vy
+  setxy next-x next-y
+  if vector-length vx vy > epsilon [set heading atan vx vy]
+end
+
+to-report vector-length [delta-x delta-y]
+  report sqrt (delta-x * delta-x + delta-y * delta-y)
+end
+
+to-report nearest-point-on-segment [px py segment]
+  let x1 item 0 segment
+  let y1 item 1 segment
+  let delta-x (item 2 segment) - x1
+  let delta-y (item 3 segment) - y1
+  let length-squared delta-x * delta-x + delta-y * delta-y
+  if length-squared = 0 [report (list x1 y1)]
+  let fraction ((px - x1) * delta-x + (py - y1) * delta-y) / length-squared
+  set fraction max (list 0 (min (list 1 fraction)))
+  report (list (x1 + fraction * delta-x) (y1 + fraction * delta-y))
+end
+
+to-report average-speed
+  if not any? pedestrians [report 0]
+  report mean [vector-length vx vy] of pedestrians
+end
+]]></code>
+  <widgets>
+    <view x="265" y="10" width="840" height="354" patchSize="27" minPxcor="0" maxPxcor="30" minPycor="0" maxPycor="12" wrappingAllowedX="false" wrappingAllowedY="false" frameRate="30" fontSize="12" showTickCounter="true" tickCounterLabel="steps" updateMode="1" />
+    <button x="10" y="10" width="75" height="40" display="setup" kind="Observer" forever="false" disableUntilTicks="false">setup</button>
+    <button x="90" y="10" width="75" height="40" display="go" kind="Observer" forever="true" disableUntilTicks="true">go</button>
+    <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
+    <slider x="10" y="65" width="235" height="50" display="population" variable="population" min="2" max="48" step="2" default="2" direction="Horizontal" units="people" />
+    <slider x="10" y="125" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
+    <slider x="10" y="185" width="235" height="50" display="desired-speed" variable="desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
+    <monitor x="10" y="380" width="115" height="55" display="simulated seconds" precision="2" fontSize="11">elapsed-seconds</monitor>
+    <monitor x="130" y="380" width="115" height="55" display="mean speed (m/s)" precision="3" fontSize="11">average-speed</monitor>
+    <monitor x="10" y="445" width="115" height="55" display="walking" precision="0" fontSize="11">count pedestrians</monitor>
+    <monitor x="130" y="445" width="115" height="55" display="arrived" precision="0" fontSize="11">arrived-count</monitor>
+    <note x="275" y="380" width="740" height="110" fontSize="13" markdown="false" backgroundLight="0" backgroundDark="0" textColorLight="-16777216" textColorDark="-1">HEAD-ON TEST WITH RANDOM FORCE
+Both pedestrians start at exactly y = 6.
+noise-strength = 0 turns the random force off.
+Change noise-seed, then setup, for another sample.
+Trails show whether and how they pass each other.</note>
+    <slider x="10" y="250" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0.05" direction="Horizontal" units="m/s^2" />
+    <slider x="10" y="310" width="235" height="50" display="noise-seed" variable="noise-seed" min="0" max="100" step="1" default="42" direction="Horizontal" units="setup" />
+  </widgets>
+  <info><![CDATA[## START HERE
+
+Click setup, then go. Click go again to pause. Use step to advance once.
+Orange pedestrians walk right; blue pedestrians walk left. They disappear
+when their path reaches a disk of radius 0.3 m around their destination.
+Starting positions, destinations and desired speed stay fixed. Each pedestrian
+gets a random force direction at setup; the direction is then kept constant.
+Use setup after changing population or noise-seed. dt, desired-speed and
+noise-strength take effect immediately.
+Start with population = 2, dt = 0.02 s and desired-speed = 1.34 m/s.
+The pair starts at (10, 6) and (20, 6), walking directly towards each other.
+Their destinations are (29, 6) and (1, 6). There is no lateral offset.
+The small random force breaks the head-on symmetry; trails show the detour.
+Start with noise-strength = 0.05 m/s^2 and noise-seed = 42. This seed repeats
+the same force directions on every setup. Change noise-seed and click setup
+for another sample. Set noise-strength = 0 to recover the symmetric stall.
+This force is a persistent individual bias, not fresh jitter every tick.
+Increase population for multiple opposing pairs in up to four shared lanes.
+For a comparison without pedestrian repulsion, run setup and enter
+"set potential-strength 0" in the Command Center before clicking go.
+Click setup to restore the original strength for the next comparison.
+
+## UNITS AND TIME
+
+One coordinate unit (one patch width) is one metre. Pedestrians use continuous
+xcor/ycor positions, not patch-to-patch jumps. All forces act as accelerations.
+One tick is one numerical step; elapsed-seconds accumulates dt. Neither depends
+on the computer's wall clock. T = anticipation-time is separate from dt.
+
+## EQUATION TO PROCEDURE MAP
+
+1: update-desired-direction computes [ex ey].
+2: calculate-acceleration starts with (desired-speed * e - v) / tau.
+3: pair-force constructs q_ij and s_j; elliptical-force evaluates -grad V.
+4: wall-force finds the nearest point on each finite wall segment.
+5: calculate-acceleration weights each pedestrian force using e dot (-f).
+6: calculate-acceleration sums the driving, pedestrian, wall and random-force terms.
+7: calculate-next-state integrates preferred velocity [wx wy].
+8: calculate-next-state limits actual velocity [vx vy] to 1.3 * desired-speed.
+9: calculate-next-state advances position with the NEW actual velocity.
+
+For Eq. 3, let r1 = ||q||, r2 = ||q-s|| and R = r1+r2. Differentiating
+with s held fixed gives:
+
+    grad b = R / (4*b) * (q/r1 + (q-s)/r2)
+    f = (V0/sigma) * exp(-b/sigma) * grad b
+
+The code uses sqrt(length-squared + epsilon-squared) for r1 and r2 and
+a roundoff floor for b. This smooths the undefined foci with epsilon = 1e-6 m.
+At exact coincident positions a smoothed force can be zero: this is a point-agent
+model, not a hard-body collision solver. Initial positions are separated.
+
+## UPDATE ORDER
+
+go has four passes: update all desired directions, calculate all accelerations,
+calculate all next states, then commit all next states. No pedestrian sees a
+neighbour's updated position or velocity during force calculation. wx/wy are
+stored separately from vx/vy and are NOT reset to the capped velocity.
+The loops use sorted agent lists to keep the calculation order deterministic.
+All random directions are sampled at setup using noise-seed. No random
+numbers are sampled while go runs. With fixed controls, a repeated setup
+reproduces the same trajectory.
+
+## PARAMETERS
+
+The interface exposes population, dt, desired-speed, noise-strength and
+noise-seed. noise-strength is the magnitude of f_i^r in m/s^2. A uniform
+angle from 0 to 360 degrees gives its direction; this choice is not calibrated
+to data. It remains constant per person while the strength slider is fixed.
+Other parameters are set near the start of setup, in the Code tab:
+
+    tau = 0.5 s
+    anticipation-time (T) = 0.5 s
+    potential-strength (V0) = 2.1 m^2/s^2
+    sigma = 0.3 m
+    view-half-angle (phi) = 100 degrees
+    rear-weight (c) = 0.5
+    wall-strength (AW) = 50 m/s^2
+    wall-range (BW) = 0.2 m
+
+AW and BW are stated in your report. Values for the other interaction
+parameters are example settings; they are not fitted to data here.
+NetLogo's sin/cos/atan use its degree and heading conventions:
+https://docs.netlogo.org/dict/atan
+
+## GEOMETRY AND LIMITATIONS
+
+The example is a 30 m corridor with walls at y=1.5 and y=10.5, open at both
+ends. wall-segments stores each wall as [x1 y1 x2 y2]; change these coordinates
+to change the force geometry. Patch colours only illustrate this corridor;
+changing colours alone does not change the walls. Wrapping is disabled.
+Destinations are points at x=1 or x=29, initially at each pedestrian's own y.
+
+Repulsion is soft. There is no extra collision force, radius offset, reflection,
+route planner or attraction term in the report's equations, so none is added.
+The circle size is purely visual. Very large timesteps can cross a wall or
+destabilize the calculation. Compare dt = 0.02 and 0.01 at equal simulated
+time before trusting a quantitative result. Leaving the NetLogo world raises
+an explanatory error rather than silently wrapping or clamping a position.
+All pedestrians currently share desired-speed; individual speeds can be added later.
+
+## SOURCE
+
+Implements equations (1)-(9) from the supplied IKT467 pedestrian report,
+including the report's once-assigned random force in Eq. (6). The fixed
+starting geometry, uniform force direction, chosen force magnitude, arrival
+rule and numerical regularization are explicit implementation choices.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" diameter="300" filled="true" marked="true" color="-1920102913" />
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" diameter="300" filled="true" marked="true" color="-1920102913" />
+    </shape>
+  </turtleShapes>
+  <linkShapes />
+  <previewCommands>setup repeat 250 [go]</previewCommands>
+</model>

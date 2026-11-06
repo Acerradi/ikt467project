@@ -1,0 +1,143 @@
+; Statistics, plotting and CSV logging shared by all scenarios.
+; Requires core/pedestrians.nls.
+;
+; Variance and standard deviation are SAMPLE statistics (divide by n - 1),
+; matching NetLogo's built-in variance / standard-deviation. Use
+; stat-population-variance if the population version (divide by n) is wanted.
+;
+; Plot widgets cannot be shared between models, but their update code can:
+; give a plot three pens named "mean", "+sd" and "-sd" and use e.g.
+;   plot-mean-sd speeds
+; as the plot's update command.
+
+globals [
+  log-file                 ; current CSV file name, or "" when not logging
+  stats-interval           ; simulated seconds between plot/log samples
+]
+
+to stats-reset
+  set log-file ""
+  set stats-interval 0.1
+end
+
+; True on steps where plots/logs should sample (every stats-interval seconds).
+to-report stats-sample?
+  report ticks mod (max (list 1 round (stats-interval / dt))) = 0
+end
+
+; ---------------------------------------------------------------- numbers
+
+to-report stat-mean [xs]
+  if empty? xs [report 0]
+  report mean xs
+end
+
+to-report stat-variance [xs]
+  if length xs < 2 [report 0]
+  report variance xs
+end
+
+to-report stat-sd [xs]
+  if length xs < 2 [report 0]
+  report standard-deviation xs
+end
+
+to-report stat-population-variance [xs]
+  if empty? xs [report 0]
+  let m mean xs
+  report (sum map [x -> (x - m) ^ 2] xs) / length xs
+end
+
+; [mean sd variance n]
+to-report stat-summary [xs]
+  report (list stat-mean xs stat-sd xs stat-variance xs length xs)
+end
+
+; ---------------------------------------------------------------- quantities
+
+; Current speed |v| of every pedestrian (m/s).
+to-report speeds
+  report [vector-length vx vy] of pedestrians
+end
+
+; Speed relative to each pedestrian's own desired speed (1 = walking at v0).
+to-report speed-ratios
+  report [vector-length vx vy / desired-speed] of pedestrians
+end
+
+; Velocity component along the desired direction e (m/s): progress made.
+to-report forward-speeds
+  report [vx * ex + vy * ey] of pedestrians
+end
+
+; Sideways speed relative to e (m/s).
+to-report lateral-speeds
+  report [abs (vy * ex - vx * ey)] of pedestrians
+end
+
+; Fraction of walking pedestrians currently slower than stop-speed.
+to-report stopped-fraction
+  if not any? pedestrians [report 0]
+  report count pedestrians with [vector-length vx vy < stop-speed] / count pedestrians
+end
+
+; Fraction of arrived pedestrians that were ever stopped after starting.
+to-report arrivals-ever-stopped-fraction
+  if empty? arrival-slow-seconds [report 0]
+  report length filter [s -> s > 0] arrival-slow-seconds / length arrival-slow-seconds
+end
+
+; ---------------------------------------------------------------- plotting
+
+; Plot mean and mean +/- one SD of xs against simulated time on the current plot.
+to plot-mean-sd [xs]
+  if empty? xs or not stats-sample? [stop]
+  let m stat-mean xs
+  let s stat-sd xs
+  set-current-plot-pen "mean"
+  plotxy elapsed-seconds m
+  set-current-plot-pen "+sd"
+  plotxy elapsed-seconds m + s
+  set-current-plot-pen "-sd"
+  plotxy elapsed-seconds m - s
+end
+
+; ---------------------------------------------------------------- CSV log
+
+; Start a CSV file (overwritten) with one row per stats-interval.
+to log-start [file-name]
+  log-stop
+  carefully [file-delete file-name] []
+  set log-file file-name
+  file-open log-file
+  file-print (word "time_s,walking,arrived,"
+    "speed_mean,speed_sd,speed_var,"
+    "speed_ratio_mean,speed_ratio_sd,speed_ratio_var,"
+    "forward_mean,forward_sd,forward_var,"
+    "lateral_mean,lateral_sd,lateral_var,"
+    "stopped_fraction,travel_time_mean,travel_time_sd,travel_time_var")
+  file-close
+end
+
+; Append one row if a log is open and this is a sampling step.
+to log-row
+  if log-file = "" or not stats-sample? [stop]
+  file-open log-file
+  file-print csv-row (sentence elapsed-seconds count pedestrians arrived-count
+    but-last stat-summary speeds
+    but-last stat-summary speed-ratios
+    but-last stat-summary forward-speeds
+    but-last stat-summary lateral-speeds
+    stopped-fraction
+    but-last stat-summary travel-times)
+  file-close
+end
+
+to log-stop
+  if is-string? log-file and log-file != "" [carefully [file-close] []]
+  set log-file ""
+end
+
+to-report csv-row [values]
+  report reduce [[a b] -> (word a "," b)] values
+end

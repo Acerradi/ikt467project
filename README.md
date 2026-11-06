@@ -6,6 +6,89 @@ Languages for modeling and simulation exam project
 Open `Pedestrians.nlogox` in NetLogo 7.0.4, click **setup**, then **go**.
 Click **go** again to pause, or **step** to advance one integration step.
 
+## Scenarios and shared modules
+
+The pedestrian model is a module that each scenario includes:
+
+| Model | Scenario |
+| --- | --- |
+| `Pedestrians.nlogox` | Hallway (open or periodic), Figure 3 lane experiment |
+| `scenarios/Door.nlogox` | Corridor split by a wall with one door, crowds on one or both sides |
+| `scenarios/TrafficLight.nlogox` | Walkway crossing a road with a light (colour + `switch-time`) |
+| `scenarios/Crossing.nlogox` | Horizontal and vertical corridors crossing at right angles |
+
+Each model starts with, for example,
+`__includes [ "../core/pedestrians.nls" "../core/checks.nls" "../core/stats.nls" ]`
+and owns only its geometry, spawning, `setup` and `go`:
+
+- `core/pedestrians.nls`: forces, integration and walls. Geometry is data: any
+  list of `[x1 y1 x2 y2]` wall segments, each exerting the wall force and
+  impenetrable to centres closer than 0.2 m. Optional per-pedestrian
+  `waypoints` (used for the door) and `stop-x` (used for the red light).
+  Including models must declare the interface variables listed in its header
+  and define a `scenario-exit-check` hook.
+- `core/checks.nls`: correctness checks: pass-throughs, smallest separation,
+  wall clearance, speed cap, overlap count and the lane counter.
+- `core/stats.nls`: mean, standard deviation and variance (sample and
+  population), plotting helpers and CSV logging every 0.1 s.
+
+Each scenario has `run-checks?` and `log-csv?` switches, check monitors, a
+speed mean ± SD plot and a BehaviorSpace experiment. Run an experiment
+headless with, for example:
+
+```bash
+JAVA_HOME=/opt/NetLogo-7.0.4/lib/runtime /opt/NetLogo-7.0.4/netlogo-headless.sh \
+  --model "$PWD/scenarios/Door.nlogox" --experiment door-width-sweep \
+  --table "$PWD/work/door-width-sweep.csv" --threads 8
+```
+
+### Scenario results (relative anticipation, no noise)
+
+**Figure 3, lanes against width** (`figure-3-lanes`, density 0.3/m², seeds
+1–3, lane count averaged over 30–60 s):
+
+| Width (m) | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Lanes | 2.48 | 3.06 | 4.36 | 5.53 | 5.93 | 7.06 | 8.84 | 9.57 | 10.36 |
+
+Least squares: lanes = 0.20 + 0.513 × width, r² = 0.990, so lane number
+grows linearly with width. The absolute count depends on the lane-splitting
+choices `lane-gap = 0.6 m` and at least 5 members per lane; the 1.5 m
+membership rule only decides who belongs to a lane.
+
+**Door** (`door-width-sweep`, 20 per side, both directions, 180 s limit).
+With the paper's wall force, both posts push back on someone in the middle
+of a narrow opening harder than an average walker's driving force
+(5.0 m/s² against 2.68 m/s² at 0.8 m). A door only one body wide therefore
+blocks even a lone pedestrian:
+
+| Door width | 0.8–0.9 m | 1.0 m | 1.1–1.2 m | 1.4 m | 1.6 m |
+| --- | --- | --- | --- | --- | --- |
+| Outcome | blocked (0–1 passages) | 7–9 of 40 pass | 24–38 of 40 pass, jams | empties in 68–79 s | empties in 45–56 s |
+| Alternation | – | ~0.38 | ~0.28 | ~0.70 | ~0.70 |
+| Pass-throughs | 0 | 0 | 0–4 | 3–5 | 1 |
+
+Alternation is the fraction of consecutive passages that change direction.
+The wide doors do alternate between sides. At every passable width the crowd
+pressing at the door squeezes people to 0.10–0.20 m apart, and a few
+pass-throughs occur: the soft pair repulsion does not resist crowd pressure,
+so this scenario fails the "no walking through each other" check.
+
+**Traffic light** (`light-cycle`, 10 per side plus 0.5 arrivals/s). On red,
+pedestrians before their curb get a stop line with desired speed
+gap / (4τ), which is critically damped: a lone walker stops at the line
+(overshoot < 5 mm, `ScenarioChecks`) and is back above 0.9 v0 within 5 s of
+green. With queues of 20–25 people, the people behind push the front row up
+to 0.47 m past its line (`max overshoot`), so a few centres end up on the
+road. Queues wait on average 0.06–0.38 m before the line.
+
+**Crossing** (`crossing-flow-sweep`, horizontal 0.8/s, one-way, vertical
+0–1.6/s, 4 m corridors, 120 s): the delay ratio (travel time / free-walking
+time) rises only from 1.036 to 1.056 for horizontal walkers. Fewer than 0.5 %
+of arrivals ever stop. There are no pass-throughs, and the closest any two
+people got was 0.35 m. At these flows pedestrians cross without stopping.
+Higher rates or narrower corridors are needed to see congestion.
+
 **Relative-velocity anticipation is now the default.** The switch
 `relative-anticipation?` selects the pair prediction on **setup**:
 
@@ -256,9 +339,24 @@ pedestrian contact force or arbitrary force cap was introduced by this audit.
 
 ## Files
 
-- `Pedestrians.nlogox`: runnable model, interface and documentation.
-- `pedestrians.nls`: readable copy of the code embedded in the model. It is not
-  a separate runnable model; keep both code copies in sync when editing.
+- `Pedestrians.nlogox`: runnable hallway scenario: interface, documentation,
+  and the hallway-specific `setup`, `go` and spawning code. It loads the shared
+  model with `__includes [ "core/pedestrians.nls" ]`.
+- `core/pedestrians.nls`: the shared pedestrian model (breed, state, forces,
+  integration, general wall contact, waypoints, stop lines). It defines no
+  `setup`/`go`; scenarios call `ped-init-constants`, `ped-check-parameters`
+  and `ped-step`, and define the `scenario-exit-check` hook. Its header lists
+  the interface variables every including model must declare. In NetLogo it
+  opens as a separate code tab and is the only copy of this code.
+- `core/checks.nls`, `core/stats.nls`: shared correctness checks and
+  statistics/plotting/logging (see *Scenarios and shared modules*).
+- `scenarios/Door.nlogox`, `scenarios/TrafficLight.nlogox`,
+  `scenarios/Crossing.nlogox`: the other scenario models, each with its own
+  Info tab and BehaviorSpace experiment.
+- `tests/ScenarioChecks.java`: vertical, oblique and door-post wall contact;
+  door waypoint and 0.8 m blocking; red-light stop without overshoot and
+  green recovery; crossing exits; lane counting and the 1.5 m rule;
+  pass-through detection; statistics helpers.
 - `tests/BoundaryChecks.java`: wall/exit regression checks using NetLogo's own
   headless API. Run from the repository root with NetLogo's Java runtime and
   jar; add `--stress` for crowded simulations and a larger-timestep check.
@@ -305,6 +403,15 @@ $netLogoHome = 'C:\Program Files\NetLogo 7.0.4'
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/EncounterChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/AnticipationChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/BehaviorComparison.java 42 relative 60
+```
+
+On Linux, with NetLogo installed in `/opt/NetLogo-7.0.4`:
+
+```bash
+N=/opt/NetLogo-7.0.4
+for t in BoundaryChecks PeriodicChecks SpeedChecks MathChecks EncounterChecks AnticipationChecks ScenarioChecks; do
+  "$N/lib/runtime/bin/java" -Djava.awt.headless=true -classpath "$N/lib/app/netlogo-7.0.4.jar" tests/$t.java || break
+done
 ```
 
 The independent diagnostics require Python with NumPy:

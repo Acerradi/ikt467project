@@ -1,0 +1,181 @@
+; Correctness checks shared by all scenarios. Requires core/pedestrians.nls.
+;
+; Reporters are usable as monitors, BehaviorSpace metrics and from the Java
+; tests. Call checks-reset in setup and checks-update after every ped-step to
+; accumulate step-by-step events (pass-throughs, worst values seen).
+;
+; Lanes follow the project definition: a pedestrian belongs to a lane if its
+; shortest distance to the least-squares line through all members of that
+; lane is less than lane-max-distance (1.5 m). Lanes are along x, so this is
+; for walkways where travel-direction is +1 (right) or -1 (left).
+
+globals [
+  check-tolerance          ; numerical slack for the checks (metres, m/s)
+  pass-through-events      ; pairs that swapped x-order while laterally overlapping
+  worst-min-separation     ; smallest centre separation seen so far (m)
+  worst-wall-clearance     ; smallest centre-to-wall distance seen so far (m)
+  speed-cap-violations     ; pedestrian-steps with |v| > 1.3 v0
+  lane-max-distance        ; 1.5 m: lane-membership distance from the project text
+  lane-gap                 ; a y-gap larger than this starts a new candidate lane
+  lane-min-members         ; smaller groups are not counted as lanes
+]
+
+to checks-reset
+  set check-tolerance 1e-9
+  set pass-through-events 0
+  set worst-min-separation 1e9
+  set worst-wall-clearance 1e9
+  set speed-cap-violations 0
+  set lane-max-distance 1.5
+  set lane-gap 0.6
+  set lane-min-members 5
+end
+
+; ---------------------------------------------------------------- per step
+
+; Call once after every ped-step.
+to checks-update
+  set pass-through-events pass-through-events + pass-through-pairs
+  set worst-min-separation min (list worst-min-separation min-pair-separation)
+  set worst-wall-clearance min (list worst-wall-clearance min-wall-clearance)
+  set speed-cap-violations speed-cap-violations + speed-cap-violation-count
+end
+
+; Pairs that, during the last step, swapped their order along x while their
+; centres were within one body-radius sideways before and after: the bodies
+; went THROUGH each other instead of around (brushing past at |dy| close to
+; 2 body-radius is not counted). The previous position is reconstructed as
+; x - dt * v, which is exact unless wall contact moved it.
+to-report pass-through-pairs
+  let events 0
+  let people sort pedestrians
+  foreach people [a ->
+    foreach people [b ->
+      if [who] of a < [who] of b [
+        let dx-now [xcor] of a - [xcor] of b
+        let dx-before ([xcor - dt * vx] of a) - ([xcor - dt * vx] of b)
+        if active-periodic? [
+          set dx-now periodic-delta-x dx-now
+          set dx-before periodic-delta-x dx-before
+        ]
+        let dy-now [ycor] of a - [ycor] of b
+        let dy-before ([ycor - dt * vy] of a) - ([ycor - dt * vy] of b)
+        if dx-now * dx-before < 0 and abs dx-now < 2 * body-radius
+           and abs dy-now < body-radius and abs dy-before < body-radius
+          [set events events + 1]
+      ]
+    ]
+  ]
+  report events
+end
+
+; ---------------------------------------------------------------- snapshot
+
+to-report min-pair-separation
+  if count pedestrians < 2 [report 1e9]
+  report min [min [separation-from [xcor] of myself [ycor] of myself] of other pedestrians] of pedestrians
+end
+
+; Pairs whose drawn circles (diameter 2 body-radius) overlap now.
+to-report overlap-pair-count
+  report (sum [count other pedestrians with
+    [separation-from [xcor] of myself [ycor] of myself < 2 * body-radius]] of pedestrians) / 2
+end
+
+; Smallest distance from any centre to any wall segment.
+to-report min-wall-clearance
+  if not any? pedestrians or empty? wall-segments [report 1e9]
+  report min [wall-clearance] of pedestrians
+end
+
+to-report wall-clearance  ; pedestrian reporter
+  report min map [wall -> distance-to-segment xcor ycor wall] wall-segments
+end
+
+to-report distance-to-segment [px py wall]
+  let nearest nearest-point-on-segment px py wall
+  report vector-length (px - item 0 nearest) (py - item 1 nearest)
+end
+
+; Centres closer to a wall than body-radius: the obstacle was entered.
+to-report wall-penetration-count
+  report count pedestrians with [wall-clearance < body-radius - check-tolerance]
+end
+
+; The paper's individual cap |v| <= 1.3 v0 (desired speed may be exceeded by
+; up to 30 %, never more).
+to-report speed-cap-violation-count
+  report count pedestrians with
+    [vector-length vx vy > 1.3 * desired-speed + check-tolerance]
+end
+
+; Pedestrians walking faster than their own desired speed right now.
+to-report above-desired-speed-count
+  report count pedestrians with
+    [vector-length vx vy > desired-speed + check-tolerance]
+end
+
+; Stop with an error if a hard invariant is broken. Use in tests/experiments.
+to check-invariants
+  if wall-penetration-count > 0 [error (word "Wall penetrated at t = " elapsed-seconds)]
+  if speed-cap-violation-count > 0 [error (word "Speed cap exceeded at t = " elapsed-seconds)]
+end
+
+; ---------------------------------------------------------------- lanes
+
+to-report lane-count
+  report (lanes-for-direction 1) + (lanes-for-direction -1)
+end
+
+to-report lanes-for-direction [direction]
+  report length lane-clusters direction
+end
+
+; Lists of pedestrians (sorted by y), one list per lane.
+to-report lane-clusters [direction]
+  let group sort-by [[a b] -> [ycor] of a < [ycor] of b]
+    pedestrians with [travel-direction = direction]
+  if empty? group [report []]
+  ; Candidate lanes: split wherever consecutive y values differ by > lane-gap.
+  let candidates []
+  let current (list first group)
+  foreach but-first group [p ->
+    ifelse [ycor] of p - [ycor] of last current > lane-gap
+      [set candidates lput current candidates
+       set current (list p)]
+      [set current lput p current]
+  ]
+  set candidates lput current candidates
+  ; Enforce the 1.5 m definition, then drop groups too small to be lanes.
+  let lanes reduce sentence (fput [] map [c -> refine-lane c] candidates)
+  report filter [c -> length c >= lane-min-members] lanes
+end
+
+; Split a candidate at its largest y gap until every member lies within
+; lane-max-distance of the cluster's regression line.
+to-report refine-lane [members]
+  if length members < 2 or max-lane-residual members < lane-max-distance
+    [report (list members)]
+  let gaps (map [[a b] -> [ycor] of b - [ycor] of a] but-last members but-first members)
+  let cut 1 + position max gaps gaps
+  report sentence refine-lane sublist members 0 cut
+                  refine-lane sublist members cut length members
+end
+
+; Largest perpendicular distance from a member to the least-squares line
+; y = a + b x. On a periodic walkway x is not continuous across the seam, so
+; the line is horizontal (b = 0) through the mean y.
+to-report max-lane-residual [members]
+  let xs map [p -> [xcor] of p] members
+  let ys map [p -> [ycor] of p] members
+  let mean-y mean ys
+  let slope 0
+  if not active-periodic? [
+    let mean-x mean xs
+    let sxx sum map [x -> (x - mean-x) ^ 2] xs
+    if sxx > 0
+      [set slope (sum (map [[x y] -> (x - mean-x) * (y - mean-y)] xs ys)) / sxx]
+    set mean-y mean-y - slope * mean-x   ; intercept a
+  ]
+  report max (map [[x y] -> abs (y - mean-y - slope * x)] xs ys) / sqrt (1 + slope ^ 2)
+end

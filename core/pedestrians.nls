@@ -1,8 +1,28 @@
-; Hallway scenario: open arrivals or a fixed population with periodic ends.
+; Pedestrian social-force core, shared by every scenario model via __includes.
 ; Coordinates: metres. Velocity: m/s. Acceleration: m/s^2.
-; Interface variables: spawn-rate, dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, periodic?, population,
-; relative-anticipation?.
+;
+; This file never defines setup or go: each scenario model owns those and
+; calls ped-init-constants, ped-check-parameters and ped-step.
+;
+; Interface contract. These names are USED here but must be DECLARED by the
+; including model, either as a widget or in its own globals [...]:
+;   dt, mean-desired-speed, desired-speed-sd, noise-strength,
+;   relative-anticipation?, show-trails?
+;
+; Required hook. Every including model must define this procedure. It runs in
+; pedestrian context inside calculate-next-state, after the goal-disk test,
+; and may set reached-goal? (left successfully) or returned? (left backwards)
+; from the buffered next-x/next-y:
+;   to scenario-exit-check ... end
+;
+; Geometry is data: wall-segments is a list of [x1 y1 x2 y2] segments. Each
+; one exerts the wall force and is impenetrable to a pedestrian's centre
+; closer than body-radius (apply-wall-contact). Optional x-periodicity:
+; set active-periodic? true and hall-length to the period.
+;
+; Per-pedestrian steering options (set by scenarios, off by default):
+;   waypoints  list of [x y] visited in order before goal-x/goal-y
+;   stop-x     false, or an x the pedestrian brakes to and waits at
 
 breed [pedestrians pedestrian]
 
@@ -14,6 +34,8 @@ globals [
   hall-bottom hall-top body-radius returned-count
   hall-length active-periodic? wrap-count
   open-left open-right active-relative-anticipation?
+  waypoint-radius stop-speed
+  travel-times arrival-slow-seconds   ; one entry per arrived pedestrian
 ]
 
 pedestrians-own [
@@ -29,11 +51,16 @@ pedestrians-own [
   returned?
   travel-direction             ; +1 right, -1 left; fixed for each pedestrian
   next-wrap-count              ; buffered seam crossings, committed once per step
+  waypoints                    ; remaining [x y] waypoints before the goal
+  stop-x                       ; false, or x-coordinate to stop at (e.g. red light)
+  drive-factor                 ; scales desired speed near stop-x; otherwise 1
+  birth-seconds                ; creation time, for travel times
+  started?                     ; has reached half its desired speed once
+  slow-seconds                 ; time spent below stop-speed after starting
 ]
 
-to setup
-  clear-all
-
+; Physical and numerical constants. Call after clear-all in every scenario setup.
+to ped-init-constants
   ; Example settings for quantities left unspecified in the report.
   set tau 0.5
   set anticipation-time 2       ; T in seconds, independent of numerical step dt
@@ -44,50 +71,33 @@ to setup
   set epsilon 0.000001         ; length softening at singular geometries
   set arrival-radius 0.3       ; metres
   set entrance-clearance 0.6   ; minimum initial separation at an entrance
-  set hall-bottom 1.5
-  set hall-top hall-bottom + 10 ; 10 m wall-to-wall width
   set body-radius 0.2          ; hard wall clearance; social forces are unchanged
-  set hall-length 50
-  set open-left 1
-  set open-right hall-length - 1
-  resize-world 0 hall-length 0 (ceiling (hall-top + 1.5))
-  set-topology false false
-  set active-periodic? periodic? ; boundary mode changes take effect on setup
-  set active-relative-anticipation? relative-anticipation? ; also fixed on setup
-
   ; Equation (4): values explicitly given in your report.
   set wall-strength 50
   set wall-range 0.2
-  ; Every wall is [x1 y1 x2 y2]. The end boundary mode is selected on setup.
-  ; Grey patches end at y=1.5 and begin at y=11.5.
-  set wall-segments (list (list 0 hall-bottom hall-length hall-bottom)
-                           (list 0 hall-top hall-length hall-top))
-  ask patches [
-    set pcolor white
-    if pycor < hall-bottom or pycor > hall-top [set pcolor gray - 2]
-    if not active-periodic? and (pxcor = open-left or pxcor = open-right) and
-      pycor > hall-bottom and pycor < hall-top
-      [set pcolor green + 3]
-  ]
-
-  ; Seed initial placement and, in open mode, later arrivals and destinations.
-  random-seed simulation-seed
-  if active-periodic? [setup-periodic-population]
-  reset-ticks
+  set active-relative-anticipation? relative-anticipation? ; fixed on setup
+  ; Scenario-independent defaults; scenarios override after this call.
+  set active-periodic? false
+  set wall-segments []
+  set waypoint-radius 0.5      ; a waypoint counts as passed within this distance
+  set stop-speed 0.1           ; below this speed (m/s) a pedestrian counts as stopped
+  set travel-times []
+  set arrival-slow-seconds []
 end
 
-to go
+; True when a new pedestrian centred at (px, py) keeps entrance-clearance
+; from everyone already present (periodic-aware).
+to-report ped-clear-at? [px py]
+  report not any? pedestrians with [separation-from px py < entrance-clearance]
+end
+
+to ped-check-parameters
   if dt <= 0 or tau <= 0 or sigma <= 0 or wall-range <= 0
     [error "dt, tau, sigma and wall-range must be positive."]
-  if spawn-rate < 0 [error "spawn-rate must not be negative."]
+end
 
-  ; spawn-rate is TOTAL attempts per simulated second across both entrances.
-  ; Multiplication by dt keeps the arrival rate independent of the step size.
-  ; An empty hallway keeps ticking so future arrivals can still occur.
-  if not active-periodic? [
-    repeat random-poisson (spawn-rate * dt) [spawn-pedestrian]
-  ]
-
+; One integration step for all pedestrians.
+to ped-step
   ; Four separate passes ensure everyone uses the same time-t state.
   ; Ordered passes also avoid introducing random ask order.
   foreach sort pedestrians [p -> ask p [update-desired-direction]]
@@ -96,64 +106,6 @@ to go
   foreach sort pedestrians [p -> ask p [commit-next-state]]
   set elapsed-seconds elapsed-seconds + dt
   tick                        ; one tick = one integration step
-end
-
-to spawn-pedestrian
-  if active-periodic? [stop]   ; no births during a periodic run
-  ; Choose an end with equal probability, then a uniform position across its width.
-  let entrance-x ifelse-value (random 2 = 0) [open-left] [open-right]
-  let entrance-y 0
-  let placed? false
-  let attempts 0
-  while [not placed? and attempts < 20] [
-    set entrance-y random-hallway-y
-    set placed? not any? pedestrians with [
-      vector-length (xcor - entrance-x) (ycor - entrance-y) < entrance-clearance
-    ]
-    set attempts attempts + 1
-  ]
-  ; Skip a blocked arrival rather than create pedestrians on top of each other.
-  if not placed? [
-    set blocked-spawn-count blocked-spawn-count + 1
-    stop
-  ]
-
-  create-pedestrians 1 [
-    initialize-pedestrian entrance-x entrance-y (hall-length - entrance-x)
-      random-hallway-y (ifelse-value (entrance-x = open-left) [1] [-1])
-  ]
-  set spawned-count spawned-count + 1
-end
-
-to setup-periodic-population
-  ; Uniform positions, balanced directions, no prescribed lanes or passing side.
-  repeat population [
-    let initial-x 0
-    let initial-y 0
-    let placed? false
-    let attempts 0
-    while [not placed? and attempts < 2000] [
-      set initial-x random-float hall-length
-      set initial-y random-hallway-y
-      set placed? not any? pedestrians with [
-        separation-from initial-x initial-y < entrance-clearance
-      ]
-      set attempts attempts + 1
-    ]
-    if not placed? [error "Could not place the periodic population with clearance. Reduce population."]
-    create-pedestrians 1 [
-      let assigned-direction ifelse-value (who mod 2 = 0) [1] [-1]
-      initialize-pedestrian initial-x initial-y
-        (ifelse-value (assigned-direction = 1) [hall-length] [0])
-        initial-y assigned-direction
-    ]
-    set spawned-count spawned-count + 1
-  ]
-end
-
-to-report random-hallway-y
-  ; Keep the same 0.75 m initial margin at each wall, for any hallway width.
-  report hall-bottom + 0.75 + random-float (hall-top - hall-bottom - 1.5)
 end
 
 to initialize-pedestrian [initial-x initial-y target-x target-y assigned-direction]
@@ -167,6 +119,11 @@ to initialize-pedestrian [initial-x initial-y target-x target-y assigned-directi
   set color ifelse-value (travel-direction = 1) [orange + 1] [blue]
   set reached-goal? false
   set returned? false
+  set waypoints []
+  set stop-x false
+  set birth-seconds elapsed-seconds
+  set started? false
+  set slow-seconds 0
   set pen-size 1
   pen-up
   ; Sample once at creation, then retain the same force direction across wraps.
@@ -196,10 +153,22 @@ to update-desired-direction
     ; There is no terminal point on a periodic walkway: keep walking along it.
     set ex travel-direction
     set ey 0
+    set drive-factor 1
     stop
   ]
-  let delta-x goal-x - xcor
-  let delta-y goal-y - ycor
+  ; Head for the next waypoint (e.g. a door opening), then the goal.
+  while [not empty? waypoints and
+         vector-length (item 0 first waypoints - xcor)
+                       (item 1 first waypoints - ycor) < waypoint-radius]
+    [set waypoints but-first waypoints]
+  let target-x goal-x
+  let target-y goal-y
+  if not empty? waypoints [
+    set target-x item 0 first waypoints
+    set target-y item 1 first waypoints
+  ]
+  let delta-x target-x - xcor
+  let delta-y target-y - ycor
   let distance-to-goal vector-length delta-x delta-y
   ifelse distance-to-goal > epsilon [
     set ex delta-x / distance-to-goal
@@ -208,12 +177,25 @@ to update-desired-direction
     set ex 0
     set ey 0
   ]
+  ; Stop line: near stop-x the desired speed becomes gap / (4 tau). With the
+  ; relaxation term of Eq. (2) this gives gap'' + gap' / tau + gap / (4 tau^2)
+  ; = 0, which is critically damped: the pedestrian slows from v0 (at
+  ; gap = 4 tau v0, about 2.7 m) and comes to rest AT the line without
+  ; overshooting. Past the line (pushed by others) the factor turns negative,
+  ; so it steps back, at most at v0.
+  ; e stays a unit vector, so the field-of-view weighting of Eq. (5) is unchanged.
+  set drive-factor 1
+  if is-number? stop-x and ex != 0 [
+    let gap (stop-x - xcor) * (ifelse-value (ex > 0) [1] [-1])
+    set drive-factor max (list -1 (min (list 1 (gap / (4 * tau * desired-speed)))))
+  ]
 end
 
 ; Equations (2), (4), (5), (6).
 to calculate-acceleration
-  set ax (desired-speed * ex - vx) / tau
-  set ay (desired-speed * ey - vy) / tau
+  ; drive-factor is exactly 1 unless a stop line is active (x * 1 = x exactly).
+  set ax (desired-speed * drive-factor * ex - vx) / tau
+  set ay (desired-speed * drive-factor * ey - vy) / tau
 
   foreach sort other pedestrians [other-person ->
     let force pair-force other-person
@@ -297,7 +279,7 @@ to calculate-next-state
   set-next-velocity-from-preferred
   set next-x xcor + dt * next-vx
   set next-y ycor + dt * next-vy
-  apply-hallway-wall-contact
+  apply-wall-contact
   if active-periodic? [
     set next-wrap-count abs (floor (next-x / hall-length))
     set next-x next-x mod hall-length
@@ -311,15 +293,9 @@ to calculate-next-state
   let closest nearest-point-on-segment goal-x goal-y path
   set reached-goal? (vector-length (goal-x - item 0 closest)
                                     (goal-y - item 1 closest)) <= arrival-radius
-  ; The whole open end is an exit. A pedestrian need not hit the exact goal disk.
-  ; Keep the fixed random goal as the steering target, but remove on crossing
-  ; its exit plane before attempting an out-of-world setxy.
-  if (goal-x = open-right and next-x >= open-right) or
-     (goal-x = open-left and next-x <= open-left)
-    [set reached-goal? true]
-  ; Being pushed back through the entrance is not a successful arrival.
-  set returned? ((goal-x = open-right and next-x < open-left) or
-                 (goal-x = open-left and next-x > open-right))
+  set returned? false
+  ; Scenario-specific exits (e.g. crossing an exit plane), defined by the model.
+  scenario-exit-check
 end
 
 to set-next-velocity-from-preferred
@@ -333,31 +309,125 @@ to set-next-velocity-from-preferred
   set next-vy next-wy * speed-factor
 end
 
-to apply-hallway-wall-contact
-  ; Additional boundary condition: the hallway walls are impenetrable.
-  ; Project preferred velocity first, then reapply the paper's speed cap.
-  ; Keeping an actual tangential component capped with the OLD norm would
-  ; violate v = w * min(1, v-max / |w|) after removing the wall-normal component.
-  let contact? false
-  if next-y < hall-bottom + body-radius [
-    set next-y hall-bottom + body-radius
-    set next-wy max (list 0 next-wy)
-    set contact? true
+; Additional boundary condition: every wall segment is impenetrable.
+; A centre may not come closer than body-radius to a segment. On contact the
+; preferred velocity loses its component into the wall, the paper's speed cap
+; is reapplied (v = w * min(1, v-max / |w|)), and the step is recomputed.
+; Keeping an actual tangential component capped with the OLD norm would
+; violate that relation after removing the wall-normal component.
+; Segments are handled one at a time, in wall-segments order.
+to apply-wall-contact
+  foreach wall-segments [wall -> apply-segment-contact wall]
+end
+
+to apply-segment-contact [wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  ; On a periodic walkway, test against the wrapped position.
+  let test-x ifelse-value active-periodic? [next-x mod hall-length] [next-x]
+  let seg-x x2 - x1
+  let seg-y y2 - y1
+  let length-squared seg-x * seg-x + seg-y * seg-y
+  let fraction -1
+  if length-squared > 0
+    [set fraction ((test-x - x1) * seg-x + (next-y - y1) * seg-y) / length-squared]
+  ifelse fraction >= 0 and fraction <= 1
+    [apply-face-contact x1 y1 seg-x seg-y test-x]
+    [ifelse fraction < 0 [apply-end-contact x1 y1] [apply-end-contact x2 y2]]
+end
+
+; Contact with the flat side of a segment. The pedestrian stays on the side
+; where its current (time-t) centre is. Axis-aligned walls use exact
+; coordinate arithmetic, identical to the original hallway rule.
+to apply-face-contact [x1 y1 seg-x seg-y test-x]
+  if seg-y = 0 [
+    let side ifelse-value (ycor > y1) [1] [-1]
+    if (side = 1 and next-y < y1 + body-radius) or
+       (side = -1 and next-y > y1 - body-radius) [
+      set next-y y1 + side * body-radius
+      if side * next-wy < 0 [set next-wy 0]
+      set-next-velocity-from-preferred
+      set next-x xcor + dt * next-vx
+    ]
+    stop
   ]
-  if next-y > hall-top - body-radius [
-    set next-y hall-top - body-radius
-    set next-wy min (list 0 next-wy)
-    set contact? true
+  if seg-x = 0 [
+    let side ifelse-value (xcor > x1) [1] [-1]
+    if (side = 1 and next-x < x1 + body-radius) or
+       (side = -1 and next-x > x1 - body-radius) [
+      set next-x x1 + side * body-radius
+      if side * next-wx < 0 [set next-wx 0]
+      set-next-velocity-from-preferred
+      set next-y ycor + dt * next-vy
+    ]
+    stop
   ]
-  if contact? [
-    set-next-velocity-from-preferred
+  ; Oblique segment: unit normal pointing to the pedestrian's current side.
+  let seg-length vector-length seg-x seg-y
+  let nx (- seg-y) / seg-length
+  let ny seg-x / seg-length
+  if (xcor - x1) * nx + (ycor - y1) * ny < 0 [
+    set nx (- nx)
+    set ny (- ny)
+  ]
+  if (test-x - x1) * nx + (next-y - y1) * ny < body-radius [
+    remove-inward-preferred nx ny
     set next-x xcor + dt * next-vx
+    set next-y ycor + dt * next-vy
+    let gap (next-x - x1) * nx + (next-y - y1) * ny
+    if gap < body-radius [
+      set next-x next-x + (body-radius - gap) * nx
+      set next-y next-y + (body-radius - gap) * ny
+    ]
   ]
+end
+
+; Contact with a segment end point (e.g. a door post): radial exclusion.
+to apply-end-contact [px py]
+  let d vector-length (next-x - px) (next-y - py)
+  if d >= body-radius [stop]
+  ; Outward direction from the post; fall back to the current centre.
+  let nx next-x - px
+  let ny next-y - py
+  if d < epsilon [
+    set nx xcor - px
+    set ny ycor - py
+    set d vector-length nx ny
+    if d < epsilon [stop]
+  ]
+  set nx nx / d
+  set ny ny / d
+  remove-inward-preferred nx ny
+  set next-x xcor + dt * next-vx
+  set next-y ycor + dt * next-vy
+  set d vector-length (next-x - px) (next-y - py)
+  if d < body-radius [
+    if d >= epsilon [
+      set nx (next-x - px) / d
+      set ny (next-y - py) / d
+    ]
+    set next-x px + body-radius * nx
+    set next-y py + body-radius * ny
+  ]
+end
+
+to remove-inward-preferred [nx ny]
+  let inward next-wx * nx + next-wy * ny
+  if inward < 0 [
+    set next-wx next-wx - inward * nx
+    set next-wy next-wy - inward * ny
+  ]
+  set-next-velocity-from-preferred
 end
 
 to commit-next-state
   if reached-goal? [
     set arrived-count arrived-count + 1
+    ; Arrival happens during this step, so it completes at elapsed-seconds + dt.
+    set travel-times lput (elapsed-seconds + dt - birth-seconds) travel-times
+    set arrival-slow-seconds lput slow-seconds arrival-slow-seconds
     die
   ]
   if returned? [
@@ -368,6 +438,11 @@ to commit-next-state
   set wy next-wy
   set vx next-vx
   set vy next-vy
+  ; Stopping statistics (bookkeeping only; does not affect motion).
+  let speed vector-length vx vy
+  ifelse speed >= 0.5 * desired-speed
+    [set started? true]
+    [if started? and speed < stop-speed [set slow-seconds slow-seconds + dt]]
   set wrap-count wrap-count + next-wrap-count
   ; Do not draw a false line across the entire view when crossing the seam.
   ifelse show-trails? and next-wrap-count = 0 [pen-down] [pen-up]
@@ -417,7 +492,45 @@ to-report desired-speed-spread
   report standard-deviation [desired-speed] of pedestrians
 end
 
-to-report pedestrian-density
-  if hall-length <= 0 or hall-top <= hall-bottom [report 0]
-  report count pedestrians / (hall-length * (hall-top - hall-bottom))
+; ---------------------------------------------------------------- scenario helpers
+
+; Try up to attempts candidate positions from candidate (an anonymous reporter
+; giving [x y]); report the first one that keeps entrance-clearance, or false.
+to-report try-place [candidate attempts]
+  repeat attempts [
+    let spot runresult candidate
+    if ped-clear-at? item 0 spot item 1 spot [report spot]
+  ]
+  report false
+end
+
+to-report random-between [low high]
+  report low + random-float (high - low)
+end
+
+; Standard exit rule for a walkway along x, usable as scenario-exit-check:
+; arrive on crossing the far exit plane (open-right when walking right,
+; open-left when walking left); pushed back through the entrance = returned.
+to x-walkway-exit-check
+  if (travel-direction = 1 and next-x >= open-right) or
+     (travel-direction = -1 and next-x <= open-left)
+    [set reached-goal? true]
+  set returned? ((travel-direction = 1 and next-x < open-left) or
+                 (travel-direction = -1 and next-x > open-right))
+end
+
+; Draw every wall segment into the drawing layer (patches are 1 m, too
+; coarse for door posts). Trails share this layer; setup's clear-all clears it.
+to draw-walls [wall-color]
+  create-turtles 1 [
+    set color wall-color
+    set pen-size 3
+    foreach wall-segments [wall ->
+      pen-up
+      setxy item 0 wall item 1 wall
+      pen-down
+      setxy item 2 wall item 3 wall
+    ]
+    die
+  ]
 end

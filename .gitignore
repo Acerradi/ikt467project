@@ -2,6 +2,9 @@
 /work/
 /preview.png
 
+# Exported chat transcripts
+/chats/
+
 # Generated caches and editor backup files
 __pycache__/
 *.pyc

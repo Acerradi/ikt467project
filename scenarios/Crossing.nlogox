@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="true">
+  <code><![CDATA[; Crossing scenario: two corridors cross at right angles. Pedestrians walk
+; horizontally and vertically through the shared square. The crossing is not
+; an object: it emerges from where the walls and the flows are placed.
+; Shared model: ../core/pedestrians.nls.
+; Interface variables: dt, mean-desired-speed, desired-speed-sd,
+; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
+; run-checks?, log-csv?, corridor-width, horizontal-rate, vertical-rate,
+; two-way?.
+
+__includes [ "../core/pedestrians.nls" "../core/checks.nls" "../core/stats.nls" ]
+
+globals [
+  center half-width       ; middle of the crossing; half the corridor width
+  open-bottom open-top    ; exit planes of the vertical corridor
+  horizontal-results      ; [travel-time free-time slow-seconds] per arrival
+  vertical-results
+]
+
+turtles-own [
+  vertical?               ; walking up/down instead of left/right
+  free-time               ; straight-line distance / desired speed at creation
+]
+
+to setup
+  clear-all
+  ped-init-constants
+  checks-reset
+  stats-reset
+  if corridor-width < 1 or corridor-width > 20 [error "corridor-width must be between 1 and 20 m."]
+  set hall-length 30
+  set center 15
+  set half-width corridor-width / 2
+  set open-left 1
+  set open-right hall-length - 1
+  set open-bottom 1
+  set open-top hall-length - 1
+  resize-world 0 hall-length 0 hall-length
+  set-topology false false
+  ; Four L-shaped corners bound a plus-shaped walkable area.
+  let lo center - half-width
+  let hi center + half-width
+  set wall-segments (list
+    (list 0 lo lo lo) (list lo 0 lo lo)                         ; bottom-left
+    (list hi lo hall-length lo) (list hi 0 hi lo)               ; bottom-right
+    (list 0 hi lo hi) (list lo hi lo hall-length)               ; top-left
+    (list hi hi hall-length hi) (list hi hi hi hall-length))    ; top-right
+  ask patches [
+    set pcolor ifelse-value ((pycor > lo and pycor < hi) or (pxcor > lo and pxcor < hi))
+      [white] [gray - 2]
+  ]
+  draw-walls black
+  set horizontal-results []
+  set vertical-results []
+  random-seed simulation-seed
+  if log-csv? [log-start "../work/crossing.csv"]
+  reset-ticks
+end
+
+to go
+  ped-check-parameters
+  if horizontal-rate < 0 or vertical-rate < 0 [error "Arrival rates must not be negative."]
+  repeat random-poisson (horizontal-rate * dt) [spawn-walker false]
+  repeat random-poisson (vertical-rate * dt) [spawn-walker true]
+  ped-step
+  if run-checks? [checks-update]
+  log-row
+end
+
+; Hook required by core/pedestrians.nls.
+to scenario-exit-check
+  ifelse vertical? [
+    if (travel-direction = 1 and next-y >= open-top) or
+       (travel-direction = -1 and next-y <= open-bottom)
+      [set reached-goal? true]
+    set returned? ((travel-direction = 1 and next-y < open-bottom) or
+                   (travel-direction = -1 and next-y > open-top))
+  ] [
+    x-walkway-exit-check
+  ]
+  if reached-goal? [
+    let result (list (elapsed-seconds + dt - birth-seconds) free-time slow-seconds)
+    ifelse vertical?
+      [set vertical-results lput result vertical-results]
+      [set horizontal-results lput result horizontal-results]
+  ]
+end
+
+; travel-direction is +1 for right/up and -1 for left/down.
+to spawn-walker [is-vertical?]
+  let direction ifelse-value (two-way? and random 2 = 0) [-1] [1]
+  let start ifelse-value (direction = 1) [open-left] [open-right]
+  let finish ifelse-value (direction = 1) [open-right] [open-left]
+  let spot try-place [-> ifelse-value is-vertical?
+      [(list random-across start)] [(list start random-across)]] 20
+  if spot = false [
+    set blocked-spawn-count blocked-spawn-count + 1
+    stop
+  ]
+  let across random-across
+  let goal ifelse-value is-vertical? [(list across finish)] [(list finish across)]
+  create-pedestrians 1 [
+    initialize-pedestrian item 0 spot item 1 spot item 0 goal item 1 goal direction
+    set vertical? is-vertical?
+    if vertical? [set color ifelse-value (direction = 1) [green - 1] [violet]]
+    set free-time vector-length (goal-x - xcor) (goal-y - ycor) / desired-speed
+  ]
+  set spawned-count spawned-count + 1
+end
+
+; A position across a corridor, 0.5 m clear of its walls.
+to-report random-across
+  report random-between (center - half-width + 0.5) (center + half-width - 0.5)
+end
+
+; ---------------------------------------------------------------- results
+; group is "horizontal" or "vertical".
+
+to-report results-of [group]
+  report ifelse-value (group = "vertical") [vertical-results] [horizontal-results]
+end
+
+to-report travel-times-of [group]
+  report map [r -> item 0 r] results-of group
+end
+
+; Travel time divided by the free-walking time (1 = never slowed down).
+to-report delay-ratios-of [group]
+  report map [r -> item 0 r / item 1 r] results-of group
+end
+
+; Fraction of arrivals that stood still (below stop-speed) at some point.
+to-report stopped-fraction-of [group]
+  let results results-of group
+  if empty? results [report 0]
+  report length filter [r -> item 2 r > 0] results / length results
+end
+
+to-report walkers-of [group]
+  report pedestrians with [vertical? = (group = "vertical")]
+end
+
+; Current speeds of one group (m/s).
+to-report speeds-of [group]
+  report [vector-length vx vy] of walkers-of group
+end
+
+; Pedestrians currently inside the shared square.
+to-report in-crossing-count
+  report count pedestrians with
+    [abs (xcor - center) < half-width and abs (ycor - center) < half-width]
+end
+]]></code>
+  <widgets>
+    <view x="265" y="10" width="469" height="469" patchSize="15" minPxcor="0" maxPxcor="30" minPycor="0" maxPycor="30" wrappingAllowedX="false" wrappingAllowedY="false" frameRate="30" fontSize="12" showTickCounter="true" tickCounterLabel="steps" updateMode="1" />
+    <button x="10" y="10" width="75" height="40" display="setup" kind="Observer" forever="false" disableUntilTicks="false">setup</button>
+    <button x="90" y="10" width="75" height="40" display="go" kind="Observer" forever="true" disableUntilTicks="true">go</button>
+    <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
+    <slider x="10" y="60" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
+    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
+    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
+    <slider x="10" y="225" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0" direction="Horizontal" units="m/s^2" />
+    <slider x="10" y="280" width="235" height="50" display="simulation-seed" variable="simulation-seed" min="0" max="1000" step="1" default="42" direction="Horizontal" units="setup" />
+    <switch x="10" y="335" width="235" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
+    <switch x="10" y="380" width="235" height="40" on="true" variable="run-checks?" display="run-checks?" />
+    <switch x="10" y="425" width="235" height="40" on="false" variable="show-trails?" display="show-trails?" />
+    <switch x="10" y="470" width="235" height="40" on="false" variable="log-csv?" display="log-csv?" />
+    <slider x="10" y="520" width="235" height="50" display="corridor-width" variable="corridor-width" min="1" max="10" step="0.5" default="4" direction="Horizontal" units="m" />
+    <slider x="10" y="575" width="235" height="50" display="horizontal-rate" variable="horizontal-rate" min="0" max="3" step="0.1" default="0.8" direction="Horizontal" units="attempts/s" />
+    <slider x="10" y="630" width="235" height="50" display="vertical-rate" variable="vertical-rate" min="0" max="3" step="0.1" default="0.8" direction="Horizontal" units="attempts/s" />
+    <switch x="10" y="685" width="235" height="40" on="false" variable="two-way?" display="two-way?" />
+    <monitor x="265" y="494" width="150" height="55" display="simulated seconds" precision="2" fontSize="11">elapsed-seconds</monitor>
+    <monitor x="425" y="494" width="150" height="55" display="walking" precision="0" fontSize="11">count pedestrians</monitor>
+    <monitor x="585" y="494" width="150" height="55" display="arrived" precision="0" fontSize="11">arrived-count</monitor>
+    <monitor x="745" y="494" width="150" height="55" display="returned" precision="0" fontSize="11">returned-count</monitor>
+    <monitor x="905" y="494" width="150" height="55" display="blocked arrivals" precision="0" fontSize="11">blocked-spawn-count</monitor>
+    <monitor x="265" y="554" width="150" height="55" display="mean speed (m/s)" precision="3" fontSize="11">stat-mean speeds</monitor>
+    <monitor x="425" y="554" width="150" height="55" display="overlapping pairs" precision="0" fontSize="11">overlap-pair-count</monitor>
+    <monitor x="585" y="554" width="150" height="55" display="pass-throughs" precision="0" fontSize="11">pass-through-events</monitor>
+    <monitor x="745" y="554" width="150" height="55" display="wall penetrations" precision="0" fontSize="11">wall-penetration-count</monitor>
+    <monitor x="905" y="554" width="150" height="55" display="min separation seen" precision="3" fontSize="11">ifelse-value (worst-min-separation &gt; 1e8) ["-"] [worst-min-separation]</monitor>
+    <monitor x="265" y="614" width="150" height="55" display="in crossing" precision="0" fontSize="11">in-crossing-count</monitor>
+    <monitor x="425" y="614" width="150" height="55" display="travel time H (s)" precision="2" fontSize="11">stat-mean travel-times-of "horizontal"</monitor>
+    <monitor x="585" y="614" width="150" height="55" display="travel time V (s)" precision="2" fontSize="11">stat-mean travel-times-of "vertical"</monitor>
+    <monitor x="745" y="614" width="150" height="55" display="delay ratio H" precision="3" fontSize="11">stat-mean delay-ratios-of "horizontal"</monitor>
+    <monitor x="905" y="614" width="150" height="55" display="delay ratio V" precision="3" fontSize="11">stat-mean delay-ratios-of "vertical"</monitor>
+    <monitor x="265" y="674" width="150" height="55" display="stopped H" precision="3" fontSize="11">stopped-fraction-of "horizontal"</monitor>
+    <monitor x="425" y="674" width="150" height="55" display="stopped V" precision="3" fontSize="11">stopped-fraction-of "vertical"</monitor>
+    <plot x="265" y="744" width="400" height="200" display="speed (m/s): mean +/- sd" xAxis="simulated seconds" yAxis="m/s" xMin="0.0" xMax="10.0" yMin="0.0" yMax="1.0" autoPlotX="true" autoPlotY="true" legend="true">
+      <setup></setup>
+      <update>plot-mean-sd speeds</update>
+      <pen display="mean" interval="1.0" mode="0" color="-16777216" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen display="+sd" interval="1.0" mode="0" color="-7500403" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen display="-sd" interval="1.0" mode="0" color="-7500403" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="675" y="744" width="400" height="200" display="speed by direction (m/s)" xAxis="simulated seconds" yAxis="m/s" xMin="0.0" xMax="10.0" yMin="0.0" yMax="1.0" autoPlotX="true" autoPlotY="true" legend="true">
+      <setup></setup>
+      <update></update>
+      <pen display="horizontal" interval="1.0" mode="0" color="-955883" legend="true">
+        <setup></setup>
+        <update>if stats-sample? and not empty? speeds-of "horizontal" [plotxy elapsed-seconds mean speeds-of "horizontal"]</update>
+      </pen>
+      <pen display="vertical" interval="1.0" mode="0" color="-10899396" legend="true">
+        <setup></setup>
+        <update>if stats-sample? and not empty? speeds-of "vertical" [plotxy elapsed-seconds mean speeds-of "vertical"]</update>
+      </pen>
+    </plot>
+  </widgets>
+  <info><![CDATA[## WHAT IS IT?
+
+Two corridors (`corridor-width` wide) cross at right angles in a 30 x 30 m
+area. Horizontal walkers (orange right, blue left) and vertical walkers
+(green up, violet down) arrive at `horizontal-rate` and `vertical-rate`
+attempts per second. With `two-way?` off, all walk right or up. The crossing
+is not an object: it is where the two flows share the central square.
+
+## WHAT TO LOOK FOR
+
+The question is how the crossing affects walking speed and travel time, and
+whether pedestrians get through without stopping.
+
+- `travel time H/V`: mean time from entering to leaving, per direction.
+- `delay ratio H/V`: travel time divided by the free-walking time
+  (straight-line distance / desired speed); 1 means never slowed down.
+- `stopped H/V`: fraction of arrivals that stood still (below 0.1 m/s) at
+  some point after first reaching half their desired speed.
+
+Compare with `vertical-rate` = 0 (no crossing traffic): the
+`crossing-flow-sweep` experiment does this.
+
+## SHARED MODEL
+
+Forces, integration and walls come from `../core/pedestrians.nls`; correctness
+checks from `../core/checks.nls`; statistics, plots and CSV logging from
+`../core/stats.nls`. Every wall segment exerts the paper's wall force and is
+impenetrable (centres stay `body-radius` = 0.2 m away).
+
+## CORRECTNESS CHECKS
+
+With `run-checks?` on, every step updates: `pass-throughs` (pairs that swapped
+order while their centres were within one body radius sideways, i.e. walked
+through each other), `min separation seen`, the closest approach to any wall
+and speed-cap violations (|v| > 1.3 v0). `overlapping pairs` counts drawn
+circles overlapping now. Pair repulsion is soft, so small overlaps can occur.
+
+## LOGGING
+
+With `log-csv?` on, setup writes `../work/<scenario>.csv` (create the `work`
+folder first): every 0.1 s, the mean, standard deviation and sample variance
+of speed, speed / desired speed, forward speed, sideways speed and completed
+travel times.
+]]></info>
+  <turtleShapes>
+    <shape name="default" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" diameter="300" filled="true" marked="true" color="-1920102913" />
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" diameter="300" filled="true" marked="true" color="-1920102913" />
+    </shape>
+  </turtleShapes>
+  <linkShapes />
+  <previewCommands>setup repeat 1500 [go]</previewCommands>
+  <experiments>
+    <experiment name="crossing-flow-sweep" repetitions="1" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="6000">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>elapsed-seconds</metric>
+        <metric>arrived-count</metric>
+        <metric>stat-mean travel-times-of "horizontal"</metric>
+        <metric>stat-sd travel-times-of "horizontal"</metric>
+        <metric>stat-mean delay-ratios-of "horizontal"</metric>
+        <metric>stopped-fraction-of "horizontal"</metric>
+        <metric>stat-mean travel-times-of "vertical"</metric>
+        <metric>stat-mean delay-ratios-of "vertical"</metric>
+        <metric>stopped-fraction-of "vertical"</metric>
+        <metric>length results-of "horizontal"</metric>
+        <metric>length results-of "vertical"</metric>
+        <metric>pass-through-events</metric>
+        <metric>worst-min-separation</metric>
+        <metric>worst-wall-clearance</metric>
+        <metric>speed-cap-violations</metric>
+        <metric>wall-penetration-count</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="relative-anticipation?">
+            <value value="true"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="noise-strength">
+            <value value="0"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="dt">
+            <value value="0.02"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="run-checks?">
+            <value value="true"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="log-csv?">
+            <value value="false"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="show-trails?">
+            <value value="false"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="mean-desired-speed">
+            <value value="1.34"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="desired-speed-sd">
+            <value value="0.26"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="horizontal-rate">
+            <value value="0.8"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="corridor-width">
+            <value value="4"></value>
+          </enumeratedValueSet>
+        <enumeratedValueSet variable="two-way?">
+            <value value="false"></value>
+          </enumeratedValueSet>
+      </constants>
+      <subExperiments>
+        <subExperiment>
+          <enumeratedValueSet variable="vertical-rate">
+            <value value="0"></value>
+            <value value="0.4"></value>
+            <value value="0.8"></value>
+            <value value="1.2"></value>
+            <value value="1.6"></value>
+          </enumeratedValueSet>
+          <enumeratedValueSet variable="simulation-seed">
+            <value value="1"></value>
+            <value value="2"></value>
+            <value value="3"></value>
+          </enumeratedValueSet>
+        </subExperiment>
+      </subExperiments>
+    </experiment>
+  </experiments>
+</model>

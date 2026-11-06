@@ -329,3 +329,24 @@ crossing is not an object. We are just going to position pedestrians and
 obstacles such that a crossing occurs. We will observe how this impact
 walking speed and travel time, and want to see if the pedestrians are able
 to walk though the crossing without stopping
+- Correctness
+  - In order to determine correctness of our model, we will compare the data from
+the simulations with our expected results. We expect that pedestrians move
+at their desired speed and do not exceed it, but slow down if there are other
+pedestrians or obstacles in their way. With no obstacles and few people, we
+expect the pedestrians to move directly to their desired position. With a door
+and a significant amount of people, we expect pedestrians to slow down or wait
+for the person in front to move through the door, and if it is very crowded, for
+people to alternate moving through the door from each side. When there is a
+red traffic light, we expect pedestrians to slow down and wait at the position
+right before the light, and for them to speed up to their desired speed when the
+light turns green. The model will fail the correctness check if pedestrians move
+through each other or obstacles. Lastly, we except pedestrians to move in lanes
+when it is very crowded. We consider pedestrians to be part of a lane if the
+shortest path between their position and the line formed of the linear regression
+of the position of all members of the lane is less than 1.5 meters. To validate
+our implementation we will redo the experiment presented in figure 3 of [1]. We
+will create a walkway with a pedestrian density of 0.3 per m2 and examine if the
+number of lanes increases linearly with the width of the walkway.**
+- Randomness
+  - Start position and desired position should be random, while desired speed should be sampled from a gaussian distribution.  

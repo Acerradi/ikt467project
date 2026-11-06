@@ -349,3 +349,5 @@ our implementation we will redo the experiment presented in figure 3 of [1]. We
 will create a walkway with a pedestrian density of 0.3 per m2 and examine if the
 number of lanes increases linearly with the width of the walkway.**
 - Logging and plots
+  - Mean, standard deviation and variance of numerical variables with respect to time?
+  

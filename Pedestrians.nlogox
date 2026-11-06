@@ -3,7 +3,8 @@
   <code><![CDATA[; Hallway scenario: open arrivals or a fixed population with periodic ends.
 ; Coordinates: metres. Velocity: m/s. Acceleration: m/s^2.
 ; Interface variables: spawn-rate, dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, periodic?, population.
+; noise-strength, simulation-seed, show-trails?, periodic?, population,
+; relative-anticipation?.
 
 breed [pedestrians pedestrian]
 
@@ -14,7 +15,7 @@ globals [
   spawned-count blocked-spawn-count entrance-clearance
   hall-bottom hall-top body-radius returned-count
   hall-length active-periodic? wrap-count
-  open-left open-right
+  open-left open-right active-relative-anticipation?
 ]
 
 pedestrians-own [
@@ -54,6 +55,7 @@ to setup
   resize-world 0 hall-length 0 (ceiling (hall-top + 1.5))
   set-topology false false
   set active-periodic? periodic? ; boundary mode changes take effect on setup
+  set active-relative-anticipation? relative-anticipation? ; also fixed on setup
 
   ; Equation (4): values explicitly given in your report.
   set wall-strength 50
@@ -239,15 +241,25 @@ to calculate-acceleration
   set ay ay + noise-strength * noise-unit-y
 end
 
-; Equation (3), using its analytic negative gradient.
+; Elliptical negative gradient, with a selectable prediction displacement.
 to-report pair-force [other-person]
   let qx xcor - [xcor] of other-person
   if active-periodic? [set qx periodic-delta-x qx]
   let qy ycor - [ycor] of other-person
-  let other-speed vector-length ([vx] of other-person) ([vy] of other-person)
-  ; s_j uses ACTUAL speed and DESIRED direction, exactly as in the PDF.
-  let sx other-speed * anticipation-time * [ex] of other-person
-  let sy other-speed * anticipation-time * [ey] of other-person
+  let sx 0
+  let sy 0
+  ifelse active-relative-anticipation? [
+    ; Relative-velocity anticipation (elliptical specification II, Eq. 12,
+    ; Johansson, Helbing & Shukla). Both velocities are actual time-t vectors.
+    ; q = x_i - x_j, so the predicted relative displacement is q - T(v_j-v_i).
+    set sx anticipation-time * ([vx] of other-person - vx)
+    set sy anticipation-time * ([vy] of other-person - vy)
+  ] [
+    ; Original 1995/report formulation: speed magnitude times desired direction.
+    let other-speed vector-length ([vx] of other-person) ([vy] of other-person)
+    set sx other-speed * anticipation-time * [ex] of other-person
+    set sy other-speed * anticipation-time * [ey] of other-person
+  ]
   report elliptical-force qx qy sx sy
 end
 
@@ -284,13 +296,7 @@ to calculate-next-state
   set next-wrap-count 0
   set next-wx wx + dt * ax
   set next-wy wy + dt * ay
-  let preferred-speed vector-length next-wx next-wy
-  let speed-factor 1
-  if preferred-speed > 0 [
-    set speed-factor min (list 1 (1.3 * desired-speed / preferred-speed))
-  ]
-  set next-vx next-wx * speed-factor
-  set next-vy next-wy * speed-factor
+  set-next-velocity-from-preferred
   set next-x xcor + dt * next-vx
   set next-y ycor + dt * next-vy
   apply-hallway-wall-contact
@@ -318,19 +324,36 @@ to calculate-next-state
                  (goal-x = open-left and next-x > open-right))
 end
 
+to set-next-velocity-from-preferred
+  ; The paper's actual velocity must always be the capped preferred velocity.
+  let preferred-speed vector-length next-wx next-wy
+  let speed-factor 1
+  if preferred-speed > 0 [
+    set speed-factor min (list 1 (1.3 * desired-speed / preferred-speed))
+  ]
+  set next-vx next-wx * speed-factor
+  set next-vy next-wy * speed-factor
+end
+
 to apply-hallway-wall-contact
   ; Additional boundary condition: the hallway walls are impenetrable.
-  ; Remove velocity into a wall so preferred velocity cannot keep driving
-  ; a pedestrian through it. Preserve tangential motion to slide along the wall.
+  ; Project preferred velocity first, then reapply the paper's speed cap.
+  ; Keeping an actual tangential component capped with the OLD norm would
+  ; violate v = w * min(1, v-max / |w|) after removing the wall-normal component.
+  let contact? false
   if next-y < hall-bottom + body-radius [
     set next-y hall-bottom + body-radius
-    set next-vy max (list 0 next-vy)
     set next-wy max (list 0 next-wy)
+    set contact? true
   ]
   if next-y > hall-top - body-radius [
     set next-y hall-top - body-radius
-    set next-vy min (list 0 next-vy)
     set next-wy min (list 0 next-wy)
+    set contact? true
+  ]
+  if contact? [
+    set-next-velocity-from-preferred
+    set next-x xcor + dt * next-vx
   ]
 end
 
@@ -432,12 +455,38 @@ The top and bottom walls stay solid in both modes.</note>
     <slider x="875" y="270" width="230" height="50" variable="desired-speed-sd" display="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
     <monitor x="715" y="430" width="170" height="55" display="mean desired (m/s)" precision="3" fontSize="11">average-desired-speed</monitor>
     <monitor x="895" y="430" width="170" height="55" display="desired SD (m/s)" precision="3" fontSize="11">desired-speed-spread</monitor>
+    <switch x="275" y="495" width="240" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
+    <monitor x="530" y="495" width="180" height="55" display="active prediction" precision="0" fontSize="11">ifelse-value (active-relative-anticipation? = true) ["relative velocity"] ["original 1995"]</monitor>
+    <note x="725" y="495" width="380" height="80" fontSize="12" markdown="false" textColorLight="-16777216" textColorDark="-1" backgroundLight="0" backgroundDark="0">ANTICIPATION (applies on setup)
+On: relative actual velocity (default).
+Off: original 1995 desired-direction prediction.
+Other force parameters are unchanged.</note>
   </widgets>
   <info><![CDATA[## START HERE
 
-Choose periodic? and click setup, then go. Boundary mode and population changes
+Choose periodic? and click setup, then go. Boundary mode, population and relative-anticipation? changes
 take effect on setup. The active mode monitor shows the mode actually running.
 Click go again to pause, or step to advance one integration step.
+
+RELATIVE ANTICIPATION (default)
+
+relative-anticipation? is on by default. The pair potential now predicts the
+relative actual motion of both pedestrians: s_ij = T * (v_j - v_i). It uses
+both x and y velocity components. This is the elliptical-specification-II
+prediction from Johansson, Helbing & Shukla, Eq. (12):
+https://arxiv.org/html/0810.4587#S3.SS3.SSS1
+
+This changes one prediction term; it is not a reproduction of the complete
+later model or its calibrated parameters. The exponential potential, analytic
+gradient, perception weights, preferred/actual velocity distinction, wall
+forces, 2 s horizon and other parameter values are retained.
+
+Turn relative-anticipation? off and click setup to compare the original 1995
+prediction s_j = T * |v_j| * e_j. The active prediction monitor shows the
+formula actually running. Changing the switch during a run takes effect only
+on the next setup, so comparisons use a consistent force law. Setup with the
+same seed produces identical initial positions, speeds and directions in
+both modes. Neither formulation imposes hard pedestrian-body collisions.
 
 PERIODIC MODE (default)
 
@@ -514,7 +563,8 @@ The random-force direction is assigned once per pedestrian and kept across
 wraps. It is not fresh jitter each tick. Set noise-strength = 0 to disable it.
 dt, noise-strength, show-trails? and open-mode spawn-rate can change during
 a run. Speed-distribution controls affect future births without changing
-existing pedestrians. periodic?, population and simulation-seed require setup.
+existing pedestrians. periodic?, relative-anticipation?, population and
+simulation-seed require setup.
 setup clears previous trails and samples a fresh periodic population.
 
 ## UNITS AND TIME
@@ -530,7 +580,9 @@ on the computer's wall clock. T = anticipation-time is separate from dt.
 In periodic mode it uses the assigned longitudinal direction [1 0] or [-1 0].
 2: calculate-acceleration starts with (desired-speed * e - v) / tau, using
 the individual pedestrian's sampled desired speed.
-3: pair-force constructs q_ij and s_j; elliptical-force evaluates -grad V.
+3: pair-force constructs q_ij and the selected prediction displacement;
+elliptical-force evaluates -grad V. The default relative displacement is
+T * (v_j - v_i); original mode uses T * |v_j| * e_j.
 Periodic mode uses the minimum-image x displacement before this calculation.
 4: wall-force finds the nearest point on each finite wall segment.
 5: calculate-acceleration weights each pedestrian force using e dot (-f).
@@ -540,7 +592,9 @@ Periodic mode uses the minimum-image x displacement before this calculation.
 9: calculate-next-state advances position with the NEW actual velocity.
 apply-hallway-wall-contact adds a solid-wall boundary condition after the free
 step: centres stay at least 0.2 m from the top/bottom walls. Motion into a wall
-is removed from actual and preferred velocity; tangential motion is preserved.
+is removed from preferred velocity while retaining its tangential component.
+Actual velocity is then recalculated from the speed cap and the along-wall
+position is updated with that consistent velocity.
 
 For Eq. 3, let r1 = ||q||, r2 = ||q-s|| and R = r1+r2. Differentiating
 with s held fixed gives:
@@ -569,7 +623,8 @@ new agents and does not resample their directions or force biases.
 
 ## PARAMETERS
 
-The interface exposes periodic?, population, spawn-rate, dt, mean-desired-speed,
+The interface exposes periodic?, relative-anticipation?, population, spawn-rate,
+dt, mean-desired-speed,
 desired-speed-sd, noise-strength, simulation-seed and show-trails?. noise-strength is the magnitude of f_i^r
 in m/s^2. A uniform
 angle from 0 to 360 degrees gives its direction; this choice is not calibrated
@@ -585,8 +640,8 @@ Other parameters are set near the start of setup, in the Code tab:
     wall-strength (AW) = 50 m/s^2
     wall-range (BW) = 0.2 m
 
-AW and BW are stated in your report. Values for the other interaction
-parameters are example settings; they are not fitted to data here.
+These interaction values match the original paper's simulation parameters.
+They have not been recalibrated for the relative-velocity extension.
 NetLogo's sin/cos/atan use its degree and heading conventions:
 https://docs.netlogo.org/dict/atan
 
@@ -608,7 +663,8 @@ y = hall-bottom + body-radius or y = hall-top - body-radius (1.7 and 11.3 m).
 This positional constraint is a hallway boundary condition in addition to the
 report's force equations. It removes outward normal velocity from both actual
 and preferred velocity to avoid continued pressure driving a pedestrian through
-the wall. Along-wall velocity is retained. It currently applies to the two
+the wall. Tangential preferred velocity is retained, and actual velocity is
+recomputed using its new norm. It currently applies to the two
 horizontal hallway walls; future interior obstacles need their own contact rule.
 
 Open ends remove pedestrians at their destination end or on returning out of
@@ -621,7 +677,8 @@ The 2 s anticipation horizon is independent of the default 0.02 s integrator ste
 
 ## SOURCE
 
-Implements equations (1)-(9) from the supplied IKT467 pedestrian report,
+Based on equations (1)-(9) from the supplied IKT467 pedestrian report, with
+relative-velocity anticipation enabled by default as described above,
 including the report's once-assigned random force in Eq. (6). The Poisson
 arrival process, uniform start/destination coordinates, entry clearance, force
 direction distribution, force magnitude, arrival rule and numerical

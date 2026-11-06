@@ -3,7 +3,7 @@
 /preview.png
 
 # Exported chat transcripts
-/chats/
+#/chats/
 
 # Generated caches and editor backup files
 __pycache__/

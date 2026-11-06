@@ -60,3 +60,5 @@ of the position of all members of the lane is less than 1.5 meters. To validate
 our implementation we will redo the experiment presented in figure 3 of [1]. We
 will create a walkway with a pedestrian density of 0.3 per m2 and examine if the
 number of lanes increases linearly with the width of the walkway.**
+- Randomness
+  - Start position and desired position should be random, while desired speed should be sampled from a gaussian distribution.  

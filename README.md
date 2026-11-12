@@ -30,10 +30,12 @@ and owns only its geometry, spawning, `setup` and `go`:
 - `core/checks.nls`: correctness checks: pass-throughs, smallest separation,
   wall clearance, speed cap, overlap count and the lane counter.
 - `core/stats.nls`: mean, standard deviation and variance (sample and
-  population), plotting helpers and CSV logging every 0.1 s.
+  population), plotting helpers and CSV logging on the first completed step
+  at or after each 0.1 s boundary, timestamped with its actual elapsed time.
 
-Each scenario has `run-checks?` and `log-csv?` switches, check monitors, a
-speed mean ± SD plot and a BehaviorSpace experiment. Run an experiment
+Each model has a `run-checks?` switch, check monitors, plots and a BehaviorSpace
+experiment. The door, traffic-light and crossing models also have `log-csv?`
+switches. Run an experiment
 headless with, for example:
 
 ```bash
@@ -42,7 +44,38 @@ JAVA_HOME=/opt/NetLogo-7.0.4/lib/runtime /opt/NetLogo-7.0.4/netlogo-headless.sh 
   --table "$PWD/work/door-width-sweep.csv" --threads 8
 ```
 
-### Scenario results (relative anticipation, no noise)
+### Scenario corrections and regression tests
+
+The force formulas, parameters, Gaussian desired speeds and individual
+`v = cap(w)` relation are unchanged. The existing relative/original prediction
+switch is retained. Hard wall contact and the red-light braking target are
+scenario additions to the social-force equations, not terms from the paper.
+
+- Wall contact now tests the whole step against segment faces and round
+  endpoints, and resolves simultaneous contact constraints together.
+- Held pedestrians cannot cross their red stop line. The smooth approach
+  braking remains; a hard boundary handles fast arrivals and crowd pressure.
+  Light changes occur at exact scheduled times, splitting a step if needed.
+  Everyone uses the same state at the start of each substep.
+- Door passages are sorted by crossing time within the step, with pedestrian
+  ID used only to break an exact time tie.
+- Checks, statistics, plots and logging do not consume the simulation's
+  random stream. Enabling them therefore does not change physical trajectories.
+- Pass-through detection uses stored start/end paths in any direction,
+  including periodic seams and pedestrians removed at exits. This diagnostic
+  uses a closest centre distance below 0.2 m; ordinary circle overlap is
+  measured separately below 0.4 m. Soft pair forces still permit overlaps.
+
+`WallContactChecks`, `DiagnosticsChecks` and `ScenarioRegressionChecks` cover
+these regressions. The last suite includes bounded crowd runs in all four
+models with both prediction options, alongside the existing mathematical tests.
+
+### Historical scenario results (relative anticipation, no noise)
+
+The experiment tables below were produced before the corrections above and
+have not been regenerated. In particular, passage order, pass-through counts,
+minimum distances and runs with logging/checks enabled must be remeasured;
+these figures are historical observations, not validation of the current code.
 
 **Figure 3, lanes against width** (`figure-3-lanes`, density 0.3/m², seeds
 1–3, lane count averaged over 30–60 s):
@@ -74,13 +107,12 @@ pressing at the door squeezes people to 0.10–0.20 m apart, and a few
 pass-throughs occur: the soft pair repulsion does not resist crowd pressure,
 so this scenario fails the "no walking through each other" check.
 
-**Traffic light** (`light-cycle`, 10 per side plus 0.5 arrivals/s). On red,
-pedestrians before their curb get a stop line with desired speed
-gap / (4τ), which is critically damped: a lone walker stops at the line
-(overshoot < 5 mm, `ScenarioChecks`) and is back above 0.9 v0 within 5 s of
-green. With queues of 20–25 people, the people behind push the front row up
-to 0.47 m past its line (`max overshoot`), so a few centres end up on the
-road. Queues wait on average 0.06–0.38 m before the line.
+**Traffic light, before the boundary fix** (`light-cycle`, 10 per side plus
+0.5 arrivals/s): the smooth gap / (4τ) braking target allowed queued people
+to move up to 0.47 m past their line. The current model adds an explicit hard
+stop boundary; that earlier overshoot is not the intended current behavior.
+The regression tests cover a fast lone arrival just as red starts, crowded
+red queues, green release and people already on the road finishing crossing.
 
 **Crossing** (`crossing-flow-sweep`, horizontal 0.8/s, one-way, vertical
 0–1.6/s, 4 m corridors, 120 s): the delay ratio (travel time / free-walking
@@ -357,6 +389,13 @@ pedestrian contact force or arbitrary force cap was introduced by this audit.
   door waypoint and 0.8 m blocking; red-light stop without overshoot and
   green recovery; crossing exits; lane counting and the 1.5 m rule;
   pass-through detection; statistics helpers.
+- `tests/WallContactChecks.java`: swept post/corner contacts, simultaneous
+  wall constraints, wall-order invariance, stop lines and periodic seams.
+- `tests/DiagnosticsChecks.java`: deterministic observation, swept pair
+  diagnostics, departed agents and elapsed-time sampling without drift.
+- `tests/ScenarioRegressionChecks.java`: exact light-event timing, red
+  boundary and release, chronological door passages, and crowd invariants in
+  all four models with both prediction options. `--quick` skips crowd runs.
 - `tests/BoundaryChecks.java`: wall/exit regression checks using NetLogo's own
   headless API. Run from the repository root with NetLogo's Java runtime and
   jar; add `--stress` for crowded simulations and a larger-timestep check.
@@ -402,6 +441,10 @@ $netLogoHome = 'C:\Program Files\NetLogo 7.0.4'
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/MathChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/EncounterChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/AnticipationChecks.java
+foreach ($suite in 'ScenarioChecks', 'WallContactChecks', 'DiagnosticsChecks', 'ScenarioRegressionChecks') {
+  & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" "tests/$suite.java"
+  if ($LASTEXITCODE -ne 0) { throw "$suite failed" }
+}
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/BehaviorComparison.java 42 relative 60
 ```
 
@@ -409,7 +452,7 @@ On Linux, with NetLogo installed in `/opt/NetLogo-7.0.4`:
 
 ```bash
 N=/opt/NetLogo-7.0.4
-for t in BoundaryChecks PeriodicChecks SpeedChecks MathChecks EncounterChecks AnticipationChecks ScenarioChecks; do
+for t in BoundaryChecks PeriodicChecks SpeedChecks MathChecks EncounterChecks AnticipationChecks ScenarioChecks WallContactChecks DiagnosticsChecks ScenarioRegressionChecks; do
   "$N/lib/runtime/bin/java" -Djava.awt.headless=true -classpath "$N/lib/app/netlogo-7.0.4.jar" tests/$t.java || break
 done
 ```

@@ -108,14 +108,27 @@ to add-pedestrian [x y direction]
   set spawned-count spawned-count + 1
 end
 
-; Record every passage through the door plane, in order.
+; Record every passage through the door plane in within-step time order.
+; Snapshots include pedestrians removed at exits during the same step.
 to track-door
+  let crossings []
+  foreach last-step-paths [path ->
+    let start-x item 1 path
+    let finish-x item 3 path
+    let old-side ifelse-value (start-x < door-x) [-1] [1]
+    let side ifelse-value (finish-x < door-x) [-1] [1]
+    if old-side != side [
+      let fraction (door-x - start-x) / (finish-x - start-x)
+      set crossings lput (list fraction (item 0 path) side) crossings
+    ]
+  ]
+  set crossings sort-by [[a b] ->
+    ifelse-value (item 0 a = item 0 b)
+      [item 1 a < item 1 b] [item 0 a < item 0 b]] crossings
+  foreach crossings [event -> set door-sequence lput (item 2 event) door-sequence]
   foreach sort pedestrians [p -> ask p [
     let side ifelse-value (xcor < door-x) [-1] [1]
-    if side != door-side [
-      set door-sequence lput side door-sequence
-      set door-side side
-    ]
+    set door-side side
     ; Not through yet (or pushed back): keep steering for the opening, so
     ; nobody walks straight at the wall beside it.
     if side != travel-direction and empty? waypoints

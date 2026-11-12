@@ -36,6 +36,8 @@ globals [
   open-left open-right active-relative-anticipation?
   waypoint-radius stop-speed
   travel-times arrival-slow-seconds   ; one entry per arrived pedestrian
+  last-step-paths                    ; [who start-x start-y unwrapped-end-x end-y]
+  last-step-start-seconds last-step-duration
 ]
 
 pedestrians-own [
@@ -57,6 +59,8 @@ pedestrians-own [
   birth-seconds                ; creation time, for travel times
   started?                     ; has reached half its desired speed once
   slow-seconds                 ; time spent below stop-speed after starting
+  previous-x previous-y         ; physical position before this integration step
+  step-end-x step-end-y         ; corrected endpoint before periodic wrapping
 ]
 
 ; Physical and numerical constants. Call after clear-all in every scenario setup.
@@ -83,6 +87,9 @@ to ped-init-constants
   set stop-speed 0.1           ; below this speed (m/s) a pedestrian counts as stopped
   set travel-times []
   set arrival-slow-seconds []
+  set last-step-paths []
+  set last-step-start-seconds 0
+  set last-step-duration 0
 end
 
 ; True when a new pedestrian centred at (px, py) keeps entrance-clearance
@@ -98,11 +105,15 @@ end
 
 ; One integration step for all pedestrians.
 to ped-step
+  set last-step-start-seconds elapsed-seconds
+  set last-step-duration dt
   ; Four separate passes ensure everyone uses the same time-t state.
   ; Ordered passes also avoid introducing random ask order.
   foreach sort pedestrians [p -> ask p [update-desired-direction]]
   foreach sort pedestrians [p -> ask p [calculate-acceleration]]
   foreach sort pedestrians [p -> ask p [calculate-next-state]]
+  ; Capture departures too: commit-next-state may remove them immediately.
+  set last-step-paths map [p -> [(list who previous-x previous-y step-end-x step-end-y)] of p] sort pedestrians
   foreach sort pedestrians [p -> ask p [commit-next-state]]
   set elapsed-seconds elapsed-seconds + dt
   tick                        ; one tick = one integration step
@@ -124,6 +135,10 @@ to initialize-pedestrian [initial-x initial-y target-x target-y assigned-directi
   set birth-seconds elapsed-seconds
   set started? false
   set slow-seconds 0
+  set previous-x xcor
+  set previous-y ycor
+  set step-end-x xcor
+  set step-end-y ycor
   set pen-size 1
   pen-up
   ; Sample once at creation, then retain the same force direction across wraps.
@@ -177,12 +192,11 @@ to update-desired-direction
     set ex 0
     set ey 0
   ]
-  ; Stop line: near stop-x the desired speed becomes gap / (4 tau). With the
-  ; relaxation term of Eq. (2) this gives gap'' + gap' / tau + gap / (4 tau^2)
-  ; = 0, which is critically damped: the pedestrian slows from v0 (at
-  ; gap = 4 tau v0, about 2.7 m) and comes to rest AT the line without
-  ; overshooting. Past the line (pushed by others) the factor turns negative,
-  ; so it steps back, at most at v0.
+  ; Near stop-x the desired speed becomes gap / (4 tau). For one-dimensional,
+  ; uncapped, unforced motion this gives a critically damped gap equation.
+  ; Critical damping alone does not prevent overshoot for every initial
+  ; approach velocity. The separate stop-line boundary below enforces the
+  ; red-light constraint; this factor supplies smooth approach braking.
   ; e stays a unit vector, so the field-of-view weighting of Eq. (5) is unchanged.
   set drive-factor 1
   if is-number? stop-x and ex != 0 [
@@ -273,6 +287,9 @@ end
 
 ; Equations (7), (8), (9). Write buffers, not the current state.
 to calculate-next-state
+  ; Also capture these when a diagnostic calls this procedure directly.
+  set previous-x xcor
+  set previous-y ycor
   set next-wrap-count 0
   set next-wx wx + dt * ax
   set next-wy wy + dt * ay
@@ -280,6 +297,8 @@ to calculate-next-state
   set next-x xcor + dt * next-vx
   set next-y ycor + dt * next-vy
   apply-wall-contact
+  set step-end-x next-x
+  set step-end-y next-y
   if active-periodic? [
     set next-wrap-count abs (floor (next-x / hall-length))
     set next-x next-x mod hall-length
@@ -309,117 +328,232 @@ to set-next-velocity-from-preferred
   set next-vy next-wy * speed-factor
 end
 
-; Additional boundary condition: every wall segment is impenetrable.
-; A centre may not come closer than body-radius to a segment. On contact the
-; preferred velocity loses its component into the wall, the paper's speed cap
-; is reapplied (v = w * min(1, v-max / |w|)), and the step is recomputed.
-; Keeping an actual tangential component capped with the OLD norm would
-; violate that relation after removing the wall-normal component.
-; Segments are handled one at a time, in wall-segments order.
+; Hard boundaries supplement the soft social forces. Wall segments are capsules
+; with radius body-radius. Detect the first swept contact, including end posts,
+; then resolve all active supporting planes together. Rechecking the whole path
+; prevents a later corner correction from violating an earlier wall.
+; A single horizontal face keeps the original hallway's normal clamp and
+; full-step tangential update, including reapplying the unchanged speed cap.
 to apply-wall-contact
-  foreach wall-segments [wall -> apply-segment-contact wall]
+  let raw-wx next-wx
+  let raw-wy next-wy
+  let raw-vx next-vx
+  let raw-vy next-vy
+  let raw-x next-x
+  let raw-y next-y
+  let planes []
+  ; A red stop line is an explicit scenario boundary, not an extra social force.
+  if is-number? stop-x [
+    let normal-x (- travel-direction)
+    if normal-x * next-x < normal-x * stop-x - 1e-10
+      [set planes (list (list normal-x 0 (normal-x * stop-x)))]
+  ]
+  let finished? false
+  let attempts 0
+  while [not finished?] [
+    if not empty? planes [
+      let velocity-planes map [plane -> (list (item 0 plane) (item 1 plane) 0)] planes
+      let projected project-to-planes raw-wx raw-wy velocity-planes
+      set next-wx item 0 projected
+      set next-wy item 1 projected
+      set-next-velocity-from-preferred
+      ; Keep the attempted normal displacement until it is clamped to contact;
+      ; use the newly capped tangential velocity for the whole step, as before.
+      let tangent-x next-vx - raw-vx
+      let tangent-y next-vy - raw-vy
+      let first-plane first planes
+      let nx item 0 first-plane
+      let ny item 1 first-plane
+      let normal-change tangent-x * nx + tangent-y * ny
+      set tangent-x tangent-x - normal-change * nx
+      set tangent-y tangent-y - normal-change * ny
+      if not empty? filter [plane -> abs (nx * item 1 plane - ny * item 0 plane) > 1e-10] planes [
+        set tangent-x 0
+        set tangent-y 0
+      ]
+      let projected-position project-to-planes (raw-x + dt * tangent-x) (raw-y + dt * tangent-y) planes
+      set next-x item 0 projected-position
+      set next-y item 1 projected-position
+    ]
+    let contact false
+    foreach wall-segments [wall ->
+      let candidate swept-wall-contact xcor ycor next-x next-y wall
+      if candidate != false [
+        ifelse contact = false
+          [set contact candidate]
+          [if item 0 candidate < item 0 contact [set contact candidate]]
+      ]
+    ]
+    ifelse contact = false
+      [set finished? true]
+      [
+        set planes lput (but-first contact) planes
+        set attempts attempts + 1
+        ; Each support plane excludes a whole convex wall capsule. If numerical
+        ; degeneracy prevents progress, fail visibly instead of crossing a wall.
+        if attempts > 4 * length wall-segments + 16
+          [error "Could not resolve wall constraints. Review geometry and initial clearance."]
+      ]
+  ]
 end
 
-to apply-segment-contact [wall]
+; Euclidean projection onto an intersection of half-planes nx*x + ny*y >= c.
+; In 2D the closest feasible point is the input, a line projection, or the
+; intersection of two boundary lines. This avoids order-dependent corrections.
+to-report project-to-planes [px py planes]
+  if inside-planes? px py planes [report (list px py)]
+  let best false
+  let best-distance 1e100
+  foreach planes [plane ->
+    let nx item 0 plane
+    let ny item 1 plane
+    let shift item 2 plane - nx * px - ny * py
+    let cx px + shift * nx
+    let cy py + shift * ny
+    if inside-planes? cx cy planes [
+      let distance-squared (cx - px) ^ 2 + (cy - py) ^ 2
+      if distance-squared < best-distance [
+        set best (list cx cy)
+        set best-distance distance-squared
+      ]
+    ]
+  ]
+  foreach range length planes [i ->
+    foreach (range (i + 1) (length planes)) [j ->
+      let a item i planes
+      let b item j planes
+      let determinant (item 0 a * item 1 b) - (item 1 a * item 0 b)
+      if abs determinant > 1e-12 [
+        let cx ((item 2 a * item 1 b) - (item 1 a * item 2 b)) / determinant
+        let cy ((item 0 a * item 2 b) - (item 2 a * item 0 b)) / determinant
+        if inside-planes? cx cy planes [
+          let distance-squared (cx - px) ^ 2 + (cy - py) ^ 2
+          if distance-squared < best-distance [
+            set best (list cx cy)
+            set best-distance distance-squared
+          ]
+        ]
+      ]
+    ]
+  ]
+  if best = false [error "Incompatible wall or stop-line constraints. Review initial placement and geometry."]
+  report best
+end
+
+to-report inside-planes? [px py planes]
+  report empty? filter [plane -> item 0 plane * px + item 1 plane * py < item 2 plane - 1e-10] planes
+end
+
+; Return [time-fraction nx ny c] for the first entry into a wall's body-radius
+; capsule, or false. Periodic full-width horizontal walls have no end posts.
+to-report swept-wall-contact [from-x from-y to-x to-y wall]
   let x1 item 0 wall
   let y1 item 1 wall
   let x2 item 2 wall
   let y2 item 3 wall
-  ; On a periodic walkway, test against the wrapped position.
-  let test-x ifelse-value active-periodic? [next-x mod hall-length] [next-x]
+  if active-periodic? and y1 = y2 and abs (x2 - x1) >= hall-length - epsilon [
+    let side ifelse-value (from-y >= y1) [1] [-1]
+    let limit side * y1 + body-radius
+    if side * to-y >= limit - 1e-10 [report false]
+    let fraction 0
+    if side * from-y > limit [set fraction (limit - side * from-y) / (side * (to-y - from-y))]
+    report (list fraction 0 side limit)
+  ]
+  if not active-periodic? [report swept-capsule-contact from-x from-y to-x to-y wall]
+  let best false
+  let first-image (floor (min (list from-x to-x) / hall-length)) - 1
+  let last-image (floor (max (list from-x to-x) / hall-length)) + 1
+  foreach (range first-image (last-image + 1)) [k ->
+    let shift k * hall-length
+    let shifted-wall (list (x1 + shift) y1 (x2 + shift) y2)
+    let candidate swept-capsule-contact from-x from-y to-x to-y shifted-wall
+    if candidate != false [
+      ifelse best = false [set best candidate]
+        [if item 0 candidate < item 0 best [set best candidate]]
+    ]
+  ]
+  report best
+end
+
+to-report swept-capsule-contact [from-x from-y to-x to-y wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  let move-x to-x - from-x
+  let move-y to-y - from-y
   let seg-x x2 - x1
   let seg-y y2 - y1
   let length-squared seg-x * seg-x + seg-y * seg-y
-  let fraction -1
-  if length-squared > 0
-    [set fraction ((test-x - x1) * seg-x + (next-y - y1) * seg-y) / length-squared]
-  ifelse fraction >= 0 and fraction <= 1
-    [apply-face-contact x1 y1 seg-x seg-y test-x]
-    [ifelse fraction < 0 [apply-end-contact x1 y1] [apply-end-contact x2 y2]]
+  let nearest nearest-point-on-segment from-x from-y wall
+  let start-nx from-x - item 0 nearest
+  let start-ny from-y - item 1 nearest
+  let start-distance vector-length start-nx start-ny
+  if start-distance < body-radius - 1e-10 [
+    if start-distance < epsilon [error "Pedestrian starts on a wall. Review initial placement."]
+    set start-nx start-nx / start-distance
+    set start-ny start-ny / start-distance
+    report (list 0 start-nx start-ny (start-nx * item 0 nearest + start-ny * item 1 nearest + body-radius))
+  ]
+  let best false
+  if length-squared > 0 [
+    let seg-length sqrt length-squared
+    let nx (- seg-y) / seg-length
+    let ny seg-x / seg-length
+    foreach [-1 1] [side ->
+      let normal-x side * nx
+      let normal-y side * ny
+      let limit normal-x * x1 + normal-y * y1 + body-radius
+      let before normal-x * from-x + normal-y * from-y
+      let change normal-x * move-x + normal-y * move-y
+      if before >= limit - 1e-10 and change < -1e-12 [
+        let fraction (limit - before) / change
+        if fraction >= -1e-10 and fraction < 1 - 1e-10 [
+          set fraction max (list 0 fraction)
+          let hit-x from-x + fraction * move-x
+          let hit-y from-y + fraction * move-y
+          let along ((hit-x - x1) * seg-x + (hit-y - y1) * seg-y) / length-squared
+          if along >= 0 and along <= 1 [
+            let candidate (list fraction normal-x normal-y limit)
+            ifelse best = false [set best candidate]
+              [if fraction < item 0 best [set best candidate]]
+          ]
+        ]
+      ]
+    ]
+  ]
+  foreach (list (list x1 y1) (list x2 y2)) [point ->
+    let candidate swept-circle-contact from-x from-y to-x to-y item 0 point item 1 point
+    if candidate != false [
+      ifelse best = false [set best candidate]
+        [if item 0 candidate < item 0 best [set best candidate]]
+    ]
+  ]
+  report best
 end
 
-; Contact with the flat side of a segment. The pedestrian stays on the side
-; where its current (time-t) centre is. Axis-aligned walls use exact
-; coordinate arithmetic, identical to the original hallway rule.
-to apply-face-contact [x1 y1 seg-x seg-y test-x]
-  if seg-y = 0 [
-    let side ifelse-value (ycor > y1) [1] [-1]
-    if (side = 1 and next-y < y1 + body-radius) or
-       (side = -1 and next-y > y1 - body-radius) [
-      set next-y y1 + side * body-radius
-      if side * next-wy < 0 [set next-wy 0]
-      set-next-velocity-from-preferred
-      set next-x xcor + dt * next-vx
-    ]
-    stop
-  ]
-  if seg-x = 0 [
-    let side ifelse-value (xcor > x1) [1] [-1]
-    if (side = 1 and next-x < x1 + body-radius) or
-       (side = -1 and next-x > x1 - body-radius) [
-      set next-x x1 + side * body-radius
-      if side * next-wx < 0 [set next-wx 0]
-      set-next-velocity-from-preferred
-      set next-y ycor + dt * next-vy
-    ]
-    stop
-  ]
-  ; Oblique segment: unit normal pointing to the pedestrian's current side.
-  let seg-length vector-length seg-x seg-y
-  let nx (- seg-y) / seg-length
-  let ny seg-x / seg-length
-  if (xcor - x1) * nx + (ycor - y1) * ny < 0 [
-    set nx (- nx)
-    set ny (- ny)
-  ]
-  if (test-x - x1) * nx + (next-y - y1) * ny < body-radius [
-    remove-inward-preferred nx ny
-    set next-x xcor + dt * next-vx
-    set next-y ycor + dt * next-vy
-    let gap (next-x - x1) * nx + (next-y - y1) * ny
-    if gap < body-radius [
-      set next-x next-x + (body-radius - gap) * nx
-      set next-y next-y + (body-radius - gap) * ny
-    ]
-  ]
-end
-
-; Contact with a segment end point (e.g. a door post): radial exclusion.
-to apply-end-contact [px py]
-  let d vector-length (next-x - px) (next-y - py)
-  if d >= body-radius [stop]
-  ; Outward direction from the post; fall back to the current centre.
-  let nx next-x - px
-  let ny next-y - py
-  if d < epsilon [
-    set nx xcor - px
-    set ny ycor - py
-    set d vector-length nx ny
-    if d < epsilon [stop]
-  ]
-  set nx nx / d
-  set ny ny / d
-  remove-inward-preferred nx ny
-  set next-x xcor + dt * next-vx
-  set next-y ycor + dt * next-vy
-  set d vector-length (next-x - px) (next-y - py)
-  if d < body-radius [
-    if d >= epsilon [
-      set nx (next-x - px) / d
-      set ny (next-y - py) / d
-    ]
-    set next-x px + body-radius * nx
-    set next-y py + body-radius * ny
-  ]
-end
-
-to remove-inward-preferred [nx ny]
-  let inward next-wx * nx + next-wy * ny
-  if inward < 0 [
-    set next-wx next-wx - inward * nx
-    set next-wy next-wy - inward * ny
-  ]
-  set-next-velocity-from-preferred
+to-report swept-circle-contact [from-x from-y to-x to-y px py]
+  let move-x to-x - from-x
+  let move-y to-y - from-y
+  let quadratic move-x * move-x + move-y * move-y
+  if quadratic = 0 [report false]
+  let qx from-x - px
+  let qy from-y - py
+  let half-linear qx * move-x + qy * move-y
+  let constant qx * qx + qy * qy - body-radius * body-radius
+  let discriminant half-linear * half-linear - quadratic * constant
+  if discriminant <= 0 [report false]
+  let fraction (- half-linear - sqrt discriminant) / quadratic
+  if fraction < -1e-10 or fraction >= 1 - 1e-10 [report false]
+  set fraction max (list 0 fraction)
+  let nx qx + fraction * move-x
+  let ny qy + fraction * move-y
+  let norm vector-length nx ny
+  if norm = 0 [report false]
+  set nx nx / norm
+  set ny ny / norm
+  if nx * move-x + ny * move-y >= -1e-12 [report false]
+  report (list fraction nx ny (nx * px + ny * py + body-radius))
 end
 
 to commit-next-state
@@ -479,17 +613,17 @@ end
 
 to-report average-speed
   if not any? pedestrians [report 0]
-  report mean [vector-length vx vy] of pedestrians
+  report mean map [p -> [vector-length vx vy] of p] sort pedestrians
 end
 
 to-report average-desired-speed
   if not any? pedestrians [report 0]
-  report mean [desired-speed] of pedestrians
+  report mean map [p -> [desired-speed] of p] sort pedestrians
 end
 
 to-report desired-speed-spread
   if count pedestrians < 2 [report 0]
-  report standard-deviation [desired-speed] of pedestrians
+  report standard-deviation map [p -> [desired-speed] of p] sort pedestrians
 end
 
 ; ---------------------------------------------------------------- scenario helpers

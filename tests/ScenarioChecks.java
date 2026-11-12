@@ -148,12 +148,10 @@ public class ScenarioChecks {
         require("not empty? lane-clusters 1 and "
             + "reduce [[a b] -> a and b] fput true map [c -> max-lane-residual c < lane-max-distance] lane-clusters 1",
             "A reported lane has a member 1.5 m or more from its regression line");
-        // Pass-through detection: swapped x-order within one body radius sideways.
-        world.command("ask pedestrians [die] "
-            + "create-pedestrians 1 [initialize-pedestrian 25.1 6 0 6 1 set vx 10] "
-            + "create-pedestrians 1 [initialize-pedestrian 25.0 6 0 6 -1 set vx -10]");
+        // Pass-through detection uses actual stored paths, not inferred vx * dt.
+        world.command("set last-step-paths [[0 24.9 6 25.1 6] [1 25.2 6 25 6]]");
         require("pass-through-pairs = 1", "Head-on pass-through not detected");
-        world.command("ask max-one-of pedestrians [who] [set ycor 6.3]");
+        world.command("set last-step-paths [[0 24.9 6 25.1 6] [1 25.2 6.3 25 6.3]]");
         require("pass-through-pairs = 0", "Passing 0.3 m apart sideways counted as pass-through");
         // Statistics helpers.
         require("abs (stat-variance [1 2 3 4] - 5 / 3) < 1e-12 and "

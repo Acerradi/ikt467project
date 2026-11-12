@@ -143,7 +143,7 @@ end
 
 ; Current speeds of one group (m/s).
 to-report speeds-of [group]
-  report [vector-length vx vy] of walkers-of group
+  report map [p -> [vector-length vx vy] of p] sort walkers-of group
 end
 
 ; Pedestrians currently inside the shared square.

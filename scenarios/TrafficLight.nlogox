@@ -59,12 +59,23 @@ to go
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
   if switch-time <= 0 [error "switch-time must be positive."]
-  repeat random-poisson (spawn-rate * dt) [spawn-at-entrance]
+  let requested-dt dt
+  let finish-time elapsed-seconds + requested-dt
+  repeat random-poisson (spawn-rate * requested-dt) [spawn-at-entrance]
+  ; A light change is an exact event: finish the current colour's interval,
+  ; then integrate any remainder under the new colour. All pedestrians still
+  ; update synchronously within each substep.
   update-light
-  ped-step
-  track-stop-lines
-  if run-checks? [checks-update]
-  log-row
+  while [elapsed-seconds < finish-time - 1e-10] [
+    set dt min (list (finish-time - elapsed-seconds) (switch-time - light-timer))
+    ped-step
+    set light-timer light-timer + dt
+    track-stop-lines
+    if run-checks? [checks-update]
+    log-row
+    update-light
+  ]
+  set dt requested-dt
 end
 
 ; Hook required by core/pedestrians.nls.
@@ -73,10 +84,9 @@ to scenario-exit-check
 end
 
 to update-light
-  set light-timer light-timer + dt
-  if light-timer >= switch-time - 1e-9 [
+  while [light-timer >= switch-time - 1e-10] [
     set light-green? not light-green?
-    set light-timer 0
+    set light-timer max (list 0 (light-timer - switch-time))
     set light-switches light-switches + 1
     draw-light
   ]
@@ -85,7 +95,7 @@ to update-light
       [set stop-x false]
       ; Only those still before their stop line are held; anyone past it
       ; (already on or at the road) completes the crossing.
-      [if stop-x = false and gap-to-stop-line > 0 [set stop-x own-stop-line]]
+      [if stop-x = false and gap-to-stop-line >= 0 [set stop-x own-stop-line]]
   ]]
 end
 
@@ -101,16 +111,16 @@ to-report gap-to-stop-line  ; pedestrian reporter
 end
 
 to track-stop-lines
-  ask pedestrians with [is-number? stop-x] [
+  foreach sort (pedestrians with [is-number? stop-x]) [p -> ask p [
     set max-stop-overshoot max (list max-stop-overshoot (- gap-to-stop-line))
-  ]
+  ]]
 end
 
 ; The light is shown on both curbs, in the grey strips outside the walls.
 to draw-light
-  ask patches with [(pycor < hall-bottom or pycor > hall-top) and
-                    (pxcor = floor road-left or pxcor = ceiling road-right)]
-    [set pcolor ifelse-value light-green? [green] [red]]
+  foreach sort (patches with [(pycor < hall-bottom or pycor > hall-top) and
+                    (pxcor = floor road-left or pxcor = ceiling road-right)])
+    [p -> ask p [set pcolor ifelse-value light-green? [green] [red]]]
 end
 
 to place-initial-crowd [direction]
@@ -160,7 +170,7 @@ end
 to-report mean-waiting-gap
   let waiting pedestrians with [is-number? stop-x and vector-length vx vy < stop-speed]
   if not any? waiting [report 0]
-  report mean [gap-to-stop-line] of waiting
+  report mean map [p -> [gap-to-stop-line] of p] sort waiting
 end
 
 ; Held pedestrians whose centre is on the road (should stay 0).
@@ -259,13 +269,22 @@ Pedestrians walk both ways (orange right, blue left).
 
 ## HOW THE LIGHT ACTS
 
-When the light is red, every pedestrian who has not yet reached its stop
+When the light is red, every pedestrian who has not yet passed its stop
 line (body touching the near curb) gets a stop line. Within about 2.7 m of it
 the desired speed becomes gap / (4 tau): together with the paper's relaxation
-term this is critically damped, so the pedestrian comes to rest at the line
-without overshooting. Someone pushed past the line steps back. Pedestrians
-already past their line when it turns red finish crossing. When the light turns green the stop lines are removed and
+term this gives critical damping for isolated, uncapped, one-dimensional
+motion. That alone does not prevent overshoot for arbitrary incoming speeds
+or crowd pressure. An explicit stop-line boundary prevents a held pedestrian
+from crossing the line and removes inward preferred velocity, then reapplies
+the unchanged speed cap. This boundary and the braking target are scenario
+rules in addition to the paper's social-force equations. Pedestrians already
+past their line when it turns red finish crossing. On green the stop lines are removed and
 the driving term accelerates everyone back towards their desired speed.
+
+A step that straddles a light change is split at the exact switching time.
+Both substeps update all pedestrians synchronously; their durations add to
+the selected dt, which is restored after go. The tick counter counts these
+integration substeps; elapsed-seconds is the physical simulation time.
 
 ## WHAT TO LOOK FOR
 

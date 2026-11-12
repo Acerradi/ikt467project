@@ -13,16 +13,26 @@
 globals [
   log-file                 ; current CSV file name, or "" when not logging
   stats-interval           ; simulated seconds between plot/log samples
+  last-logged-seconds      ; prevents duplicate rows from repeated calls in one step
 ]
 
 to stats-reset
   set log-file ""
   set stats-interval 0.1
+  set last-logged-seconds -1
 end
 
-; True on steps where plots/logs should sample (every stats-interval seconds).
+; Sample the first completed step at/after each interval boundary. The row uses
+; its actual elapsed time; no interpolation is implied. For dt=.03 and an
+; interval of .1 this gives .12, .21, .30, ... instead of drifting by .09.
+; This reporter is idempotent so plot and CSV callers see the same decision.
 to-report stats-sample?
-  report ticks mod (max (list 1 round (stats-interval / dt))) = 0
+  if stats-interval <= 0 [error "stats-interval must be positive."]
+  if elapsed-seconds = 0 [report true]
+  if last-step-duration <= 0 [report false]
+  let time-slack 1e-10 * stats-interval
+  report floor ((last-step-start-seconds + last-step-duration + time-slack) / stats-interval) >
+         floor ((last-step-start-seconds + time-slack) / stats-interval)
 end
 
 ; ---------------------------------------------------------------- numbers
@@ -57,28 +67,29 @@ end
 
 ; Current speed |v| of every pedestrian (m/s).
 to-report speeds
-  report [vector-length vx vy] of pedestrians
+  report map [p -> [vector-length vx vy] of p] sort pedestrians
 end
 
 ; Speed relative to each pedestrian's own desired speed (1 = walking at v0).
 to-report speed-ratios
-  report [vector-length vx vy / desired-speed] of pedestrians
+  report map [p -> [vector-length vx vy / desired-speed] of p] sort pedestrians
 end
 
 ; Velocity component along the desired direction e (m/s): progress made.
 to-report forward-speeds
-  report [vx * ex + vy * ey] of pedestrians
+  report map [p -> [vx * ex + vy * ey] of p] sort pedestrians
 end
 
 ; Sideways speed relative to e (m/s).
 to-report lateral-speeds
-  report [abs (vy * ex - vx * ey)] of pedestrians
+  report map [p -> [abs (vy * ex - vx * ey)] of p] sort pedestrians
 end
 
 ; Fraction of walking pedestrians currently slower than stop-speed.
 to-report stopped-fraction
   if not any? pedestrians [report 0]
-  report count pedestrians with [vector-length vx vy < stop-speed] / count pedestrians
+  let people sort pedestrians
+  report (length filter [p -> [vector-length vx vy < stop-speed] of p] people) / length people
 end
 
 ; Fraction of arrived pedestrians that were ever stopped after starting.
@@ -104,11 +115,12 @@ end
 
 ; ---------------------------------------------------------------- CSV log
 
-; Start a CSV file (overwritten) with one row per stats-interval.
+; Start a CSV file (overwritten), sampled on steps crossing interval boundaries.
 to log-start [file-name]
   log-stop
-  carefully [file-delete file-name] []
+  if file-exists? file-name [file-delete file-name]
   set log-file file-name
+  set last-logged-seconds -1
   file-open log-file
   file-print (word "time_s,walking,arrived,"
     "speed_mean,speed_sd,speed_var,"
@@ -121,7 +133,7 @@ end
 
 ; Append one row if a log is open and this is a sampling step.
 to log-row
-  if log-file = "" or not stats-sample? [stop]
+  if log-file = "" or not stats-sample? or elapsed-seconds = last-logged-seconds [stop]
   file-open log-file
   file-print csv-row (sentence elapsed-seconds count pedestrians arrived-count
     but-last stat-summary speeds
@@ -131,6 +143,7 @@ to log-row
     stopped-fraction
     but-last stat-summary travel-times)
   file-close
+  set last-logged-seconds elapsed-seconds
 end
 
 to log-stop

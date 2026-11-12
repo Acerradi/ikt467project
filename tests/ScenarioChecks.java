@@ -129,7 +129,22 @@ public class ScenarioChecks {
             + "and arrived-count > 0 and empty? horizontal-results",
             "Vertical walkers were not recorded as vertical arrivals");
         require("min delay-ratios-of \"vertical\" >= 1", "Delay ratio below free walking");
-        System.out.println("PASS: crossing exits and per-direction travel records.");
+
+        // A downward walker pushed into the left horizontal arm (seen stuck in
+        // crowded runs): its goal is straight below, behind the arm's wall.
+        world.command("set horizontal-rate 0 set vertical-rate 0 setup "
+            + "create-pedestrians 1 [initialize-pedestrian 12.07 13.68 13.7 1 -1 "
+            + "set vertical? true set free-time 15]");
+        world.command("go");
+        require("[waypoints = [[15 13.68]]] of one-of pedestrians",
+            "Displaced walker was not routed back to its corridor's centre line");
+        world.command("repeat 1500 [go check-invariants]");
+        require("count pedestrians = 0 and arrived-count = 1",
+            "Walker displaced into the other corridor's arm did not get out and arrive");
+        // Walkers inside their own band never get a detour.
+        world.command("setup repeat 2 [spawn-walker true] repeat 2 [spawn-walker false] repeat 200 [go]");
+        require("all? pedestrians [empty? waypoints]", "Walker inside its own corridor got a detour");
+        System.out.println("PASS: crossing exits, per-direction travel records, displaced-walker detour.");
     }
 
     private static void laneAndStatsChecks() throws Exception {

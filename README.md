@@ -44,6 +44,26 @@ JAVA_HOME=/opt/NetLogo-7.0.4/lib/runtime /opt/NetLogo-7.0.4/netlogo-headless.sh 
   --table "$PWD/work/door-width-sweep.csv" --threads 8
 ```
 
+To run all four experiments (`figure-3-lanes`, `door-width-sweep`,
+`light-cycle`, `crossing-flow-sweep`) with one command, use
+`run-experiments.sh` from the repository root (bash; on Windows use WSL or
+Git Bash):
+
+```bash
+./run-experiments.sh                                   # all experiments
+./run-experiments.sh door-width-sweep light-cycle      # only the named ones
+THREADS=8 ./run-experiments.sh                         # limit parallel runs
+NETLOGO_HOME=/path/to/NetLogo ./run-experiments.sh     # other install location
+```
+
+- Arguments: experiment names to run; with none, all run in the order above.
+- `THREADS`: parallel BehaviorSpace runs (default: number of CPU cores).
+- `NETLOGO_HOME`: NetLogo install directory (default `/opt/NetLogo-7.0.4`).
+- `JAVA_HOME`: Java runtime (default `$NETLOGO_HOME/lib/runtime`).
+
+Each experiment's table output is written to `work/<experiment>.csv`,
+overwriting any earlier result.
+
 ### Scenario corrections and regression tests
 
 The force formulas, parameters, Gaussian desired speeds and individual
@@ -70,309 +90,6 @@ scenario additions to the social-force equations, not terms from the paper.
 these regressions. The last suite includes bounded crowd runs in all four
 models with both prediction options, alongside the existing mathematical tests.
 
-### Historical scenario results (relative anticipation, no noise)
-
-The experiment tables below were produced before the corrections above and
-have not been regenerated. In particular, passage order, pass-through counts,
-minimum distances and runs with logging/checks enabled must be remeasured;
-these figures are historical observations, not validation of the current code.
-
-**Figure 3, lanes against width** (`figure-3-lanes`, density 0.3/m², seeds
-1–3, lane count averaged over 30–60 s):
-
-| Width (m) | 4 | 6 | 8 | 10 | 12 | 14 | 16 | 18 | 20 |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Lanes | 2.48 | 3.06 | 4.36 | 5.53 | 5.93 | 7.06 | 8.84 | 9.57 | 10.36 |
-
-Least squares: lanes = 0.20 + 0.513 × width, r² = 0.990, so lane number
-grows linearly with width. The absolute count depends on the lane-splitting
-choices `lane-gap = 0.6 m` and at least 5 members per lane; the 1.5 m
-membership rule only decides who belongs to a lane.
-
-**Door** (`door-width-sweep`, 20 per side, both directions, 180 s limit).
-With the paper's wall force, both posts push back on someone in the middle
-of a narrow opening harder than an average walker's driving force
-(5.0 m/s² against 2.68 m/s² at 0.8 m). A door only one body wide therefore
-blocks even a lone pedestrian:
-
-| Door width | 0.8–0.9 m | 1.0 m | 1.1–1.2 m | 1.4 m | 1.6 m |
-| --- | --- | --- | --- | --- | --- |
-| Outcome | blocked (0–1 passages) | 7–9 of 40 pass | 24–38 of 40 pass, jams | empties in 68–79 s | empties in 45–56 s |
-| Alternation | – | ~0.38 | ~0.28 | ~0.70 | ~0.70 |
-| Pass-throughs | 0 | 0 | 0–4 | 3–5 | 1 |
-
-Alternation is the fraction of consecutive passages that change direction.
-The wide doors do alternate between sides. At every passable width the crowd
-pressing at the door squeezes people to 0.10–0.20 m apart, and a few
-pass-throughs occur: the soft pair repulsion does not resist crowd pressure,
-so this scenario fails the "no walking through each other" check.
-
-**Traffic light, before the boundary fix** (`light-cycle`, 10 per side plus
-0.5 arrivals/s): the smooth gap / (4τ) braking target allowed queued people
-to move up to 0.47 m past their line. The current model adds an explicit hard
-stop boundary; that earlier overshoot is not the intended current behavior.
-The regression tests cover a fast lone arrival just as red starts, crowded
-red queues, green release and people already on the road finishing crossing.
-
-**Crossing** (`crossing-flow-sweep`, horizontal 0.8/s, one-way, vertical
-0–1.6/s, 4 m corridors, 120 s): the delay ratio (travel time / free-walking
-time) rises only from 1.036 to 1.056 for horizontal walkers. Fewer than 0.5 %
-of arrivals ever stop. There are no pass-throughs, and the closest any two
-people got was 0.35 m. At these flows pedestrians cross without stopping.
-Higher rates or narrower corridors are needed to see congestion.
-In such crowded runs, walkers pushed into the other corridor's arm used to
-stay pinned against its wall, because they steer straight at a goal behind
-it. A displaced walker now first heads back to its own corridor's centre
-line (see the model's Info tab, `ScenarioChecks`).
-
-**Relative-velocity anticipation is now the default.** The switch
-`relative-anticipation?` selects the pair prediction on **setup**:
-
-- On: `s_ij = T * (v_j - v_i)`, using both pedestrians' actual x/y velocities.
-- Off: original 1995 prediction `s_j = T * |v_j| * e_j`.
-
-The `active prediction` monitor shows the formula currently running. Changing
-the switch while walking takes effect only on the next setup. Both modes use
-identical initial positions and sampled attributes for the same seed.
-
-This is a single relative-velocity extension from
-[Johansson, Helbing and Shukla, Eq. (12)](https://arxiv.org/html/0810.4587#S3.SS3.SSS1),
-not the complete calibrated later model. The ellipse, exponential potential,
-analytic gradient, perception weighting, preferred/actual velocity distinction,
-wall forces and previous parameter values are retained. The interaction is
-still soft; this extension does not guarantee nonoverlapping physical bodies.
-
-The hallway has two boundary modes. Choose `periodic?`, then click **setup**.
-The active-mode monitor shows which mode is running. Orange pedestrians walk
-right; blue pedestrians walk left. The top and bottom remain solid walls.
-
-**Periodic mode** is the default. It starts with `population = 150` pedestrians
-randomly scattered throughout the hallway, split equally between directions.
-Pedestrians crossing one end reappear at the other with their identity, y,
-actual/preferred velocities, walking direction and force bias retained. The
-population stays fixed and no new pedestrians are spawned. Their desired
-directions are along the hallway, rather than towards random terminal points.
-This avoids repeatedly steering them across the hallway after each wrap.
-
-The x period is exactly `50` m, with coordinates wrapped into `[0,50)`. Pair
-forces and initial-placement clearance use the minimum-image displacement
-across the seam. NetLogo's built-in wrapping is disabled because the view has
-51 patches, while the modeled hallway length is 50 m. `seam crossings` counts
-boundary crossings in either direction. Density is population / `(50 * 10)`;
-150 pedestrians give exactly `0.3` people/m^2. This uses the 500 m^2 physical
-hallway area, not the patch-grid area or the smaller area available to centres.
-
-This comparison is motivated by the discussion of periodic boundaries and lane
-stability in [Section IV of Helbing & Molnar](https://arxiv.org/html/cond-mat/9805244#S4).
-No lanes are assigned. Lane stability remains an experimental outcome. The
-paper's illustrated simulations omit fluctuations, so `noise-strength` defaults
-to `0`. Each pedestrian has an individual Gaussian desired speed, sampled once
-at creation with mean `1.34 m/s` and standard deviation `0.26 m/s`. Nonpositive
-draws are resampled; this rejects an extremely small tail at the default values.
-The anticipation horizon is `2` seconds, separate from the integration timestep.
-
-**Open mode** starts empty. Pedestrians enter near either end and get an
-independently sampled destination at the opposite end. That destination stays
-fixed. They leave when they reach the target or cross the opposite exit plane.
-Anyone pushed back out of their entrance is counted separately as `returned`.
-
-- `periodic?`: selects the boundary mode on **setup**.
-- `relative-anticipation?`: on by default; selects relative actual velocity
-  instead of the original desired-direction prediction on **setup**.
-- `population`: initial fixed population in periodic mode; requires **setup**.
-- `spawn-rate`: total attempted arrivals per simulated second, shared by both
-  ends in open mode; default `1`. Set it to `0` to let that mode empty. Ignored
-  in periodic mode.
-- `dt`: simulated seconds per integration step; default `0.02`.
-- `mean-desired-speed`: mean of the desired-speed distribution; default `1.34 m/s`.
-- `desired-speed-sd`: its standard deviation; default `0.26 m/s`. Set to `0`
-  for identical speeds. Both distribution controls apply at creation. Changing
-  them does not alter existing pedestrians; use **setup** to resample a periodic
-  population. Each pedestrian retains their sampled `desired-speed` across
-  wraps, and their own speed cap is `1.3` times that individual value.
-- `noise-strength`: once-assigned random-force magnitude in m/s^2; default
-  `0` (off). Initial positions and desired speeds remain random.
-- `simulation-seed`: seed for initial placement and, in open mode, arrivals and
-  random-force directions; default `42`. Click **setup** after changing it.
-  The same seed and settings reproduce the same run.
-- `show-trails?`: draw pedestrian paths; off by default. **setup** clears them.
-
-In open mode, arrivals follow a Poisson process with an expected
-`spawn-rate * dt` arrivals per step. Starting and destination y-coordinates are sampled uniformly from `2.25`
-to `10.75` m. A new pedestrian starts at rest at `x = 1` or `x = 49` and must
-initially be at least `0.6` m from existing pedestrians. An arrival is skipped
-and counted as blocked if no clear position is found in 20 attempts. Periodic
-initialization uses uniform positions across the whole hallway with `0.6` m
-clearance, including across the seam.
-
-The model includes desired motion, elliptical pedestrian repulsion, wall
-repulsion and the once-assigned random force. Attraction is deferred.
-The force bias is inactive at the zero-strength default. The mean desired-speed
-and desired-speed SD monitors show the current population's sample statistics,
-which will differ slightly from the configured distribution parameters.
-
-Read the model's **Info** tab for the equation mapping, parameters and numerical
-choices. Pedestrian repulsion is soft, so circles can overlap. The two hallway
-walls additionally enforce solid contact: centres remain at least `0.2` m from
-the walls. The preferred velocity into a wall is removed, its tangential
-component is retained, and actual velocity is recalculated from the paper's
-speed cap before updating along-wall position.
-This boundary rule supplements the social-force equations. The open ends remove
-departing pedestrians before they can leave the NetLogo world. Counts satisfy
-`spawned = walking + arrived + returned` in open mode. In periodic mode,
-`spawned = walking = initial population`, with arrivals and returns both zero.
-
-Starting positions do not prescribe lanes. Higher arrival rates can increase
-crowding and the computational cost of all-pairs interactions.
-
-With the original prediction and 2 s horizon, crowded open-mode runs can retain interacting
-pedestrians near their different exit targets after arrivals stop. In the earlier
-30-by-9 m geometry, seed 42 at spawn-rate 5 for 120 s left two pedestrians after
-a further 300 s without arrivals. That historical result is not a validation
-result for the new dimensions. Wall bounds and population accounting still held. This flow
-limitation remains visible in the walking count; it is not counted as arrival.
-The default periodic mode is covered separately by fixed-population tests.
-
-## Mathematical audit and original-model diagnosis
-
-### Validation of the implemented relative option
-
-The actual NetLogo model was tested for 60 simulated seconds in both modes
-with seeds 42, 1 and 7: six completed runs, each with 150 pedestrians in the
-50-by-10 m periodic hallway, `dt = 0.02`, `T = 2`, and no random force. Bounds,
-fixed population/density, individual speed caps and `v = cap(w)` held at every
-step. Individual desired speeds remained unchanged. Behavior was sampled every
-0.1 s; speed statistics exclude the first 10 s.
-
-| Metric, pooled equally across three runs per mode | Original | Relative |
-| --- | ---: | ---: |
-| Mean overlapping pairs per sampled frame (distance < 0.4 m) | 4.8667 | 0.00278 |
-| Mean absolute lateral speed, 10–60 s | 0.2548 m/s | 0.0781 m/s |
-| Mean forward speed, 10–60 s | 1.2489 m/s | 1.2808 m/s |
-| Minimum sampled centre separation | 0.0260 m | 0.3732 m |
-| Pair-sample observations closer than 0.1 m | 45 | 0 |
-
-The reductions are about 69% in mean lateral speed and 99.94% in mean sampled
-overlapping pairs. Five overlapping pair-sample observations remain in relative
-mode across 1,800 sampled frames. These finite runs and sampled distances do
-not guarantee absence of overlap or events between samples.
-
-The saved two-pedestrian encounter, simulated with all 150 neighbors, was also
-replayed in NetLogo. Relative anticipation keeps the pair at least 0.6388666 m
-apart at every integration step and agrees with independent solver endpoints
-within `1e-8 m`. The original reference replay remains unchanged. The 29 new
-anticipation checks, 40 mathematical checks, and existing boundary, speed and
-periodic suites all pass. An additional 30 s open-mode smoke run at 3 spawn
-attempts/s completed with valid bounds and population accounting; this is not
-a full crowded-flow/draining validation.
-
-Per-run CSVs are in `work/behavior-comparison-seed{seed}-{mode}-60.00s.csv`.
-Rerun the commands below to regenerate them from the current model. The
-independent one-seed experiments later in this section predate this production
-validation and use a different sampling schedule.
-
-The force gradient, front/rear weighting, wall potential, individual speed cap,
-and isolated-motion update are checked independently in `tests/MathChecks.java`.
-The negative gradient is compared with finite differences of the original
-potential, rather than a copy of the implementation's gradient formula.
-The wall-contact code now reapplies `v = w * min(1, v-max / |w|)` after projecting
-`w`. Previously it retained an actual tangential velocity capped using the old
-norm, which was inconsistent with that relation.
-
-Passing these checks does not establish collision-free motion. In a 60 s
-diagnostic of the pre-fix default 150-person hallway (seed 42, no noise), the
-minimum centre separation was `0.01022 m`, with a recorded opposite-direction
-pass-through. At `dt = 0.005` instead of `0.02`, the minimum was still `0.05148 m`.
-These independent full runs diverge, so their individual collisions are not
-matched convergence measurements. Replaying the same interior encounter from
-the same saved state at `dt = 0.001` and `0.0002` also retained pass-through,
-with minimum separations `0.01448 m` and `0.01446 m`. This local refinement
-does not support a large-timestep explanation for that particular encounter.
-The wall-contact fix does not establish a remedy for
-these interior encounters.
-
-### Traced causes and independent reproduction
-
-The recorded original-mode encounter of pedestrians 3 and 52 at about 21 s was reconstructed
-term by term. At 20.72 s, other pedestrians contribute lateral accelerations
-of `-9.36` and `+6.23 m/s^2`, pushing the pair towards each other. Their mutual
-lateral avoidance is only `+0.31` and `-0.30 m/s^2`. Both are turning sideways,
-but the literal 1995 prediction `s_j = T * |v_j| * e_j` remains aligned with
-the desired hallway direction. The force-direction perception rule also gives
-their mutual interaction half weight during much of the encounter. This is
-not a force-sign transcription error. Other neighbors' forces overwhelm the
-pair's avoidance before it can maintain the drawn 0.4 m diameter.
-
-An independent NumPy implementation reproduces NetLogo's first-order replay
-to about `1e-12 m`. Fourth-order Runge-Kutta with `h = 0.0002 s` still gives
-minimum separation `0.01452 m`. Removing the `1e-6 m` softening changes that
-minimum by only `6.3e-8 m`. No hard-wall contact occurs in this replay. These
-tests isolate this encounter from NetLogo, the wall projection, and ordinary
-timestep/softening explanations; they do not prove every trajectory accurate.
-
-The longest sampled sideways episode has a different detailed sequence.
-Pedestrian 136 receives `+7.17 m/s^2` sideways from an anticipated ellipse
-while its source is still 2.92 m away. A second anticipated endpoint later
-produces about `+11 m/s^2`. Preferred speed accumulates to 3.38 m/s, while
-actual speed is capped at 0.956 m/s. It therefore continues sideways after
-acceleration starts braking it, and the soft wall force subsequently reverses
-it. This episode never reaches the added hard-contact boundary.
-
-Controlled prediction changes help distinguish the cause from a numerical
-bug. For the same saved encounter, at RK4 timestep 0.001 s:
-
-| Prediction displacement | Minimum centre separation |
-| --- | ---: |
-| Original: `T * |v_j| * e_j` | 0.0148 m |
-| Actual velocity: `T * v_j` | 0.6400 m |
-| Relative velocity: `T * (v_j - v_i)` | 0.6368 m |
-| Original prediction, full perception weight | 0.0585 m |
-
-Changing a prediction is a model change. In particular, substituting actual
-velocity alone is not a reliable fix: a matched 60 s, seed-42 comparison using
-the independent first-order solver made crowd-wide behavior worse. The
-relative-velocity variant performed much better in that one comparison:
-
-| Prediction | Mean overlapping pairs | Mean absolute lateral speed, 10–60 s |
-| --- | ---: | ---: |
-| Original desired direction | 4.627 | 0.253 m/s |
-| Actual velocity | 4.838 | 0.338 m/s |
-| Relative velocity | 0.00267 | 0.0711 m/s |
-
-The relative variant still had a minimum separation of 0.381 m, slightly less
-than the drawn diameter. These are one-seed diagnostic results, not proof of
-collision-free motion or a calibrated replacement for the paper's model.
-All comparison arms keep the same parameters, force-direction weights, and
-separate preferred/actual velocity. Only the prediction displacement changes.
-
-Helbing's later coauthored paper explains that elliptical specification I
-ignores the affected walker's own speed/direction and introduces relative
-velocity in specification II:
-[Johansson, Helbing and Shukla, Section 3.3.1](https://arxiv.org/html/0810.4587#S3.SS3.SSS1).
-A numerical analysis also documents collisions and oscillations at small
-timesteps in social-force models:
-[Koster, Treml and Godel (2013)](https://doi.org/10.1103/PhysRevE.87.063305).
-Those sources support examining model limitations; they do not establish the
-precise undocumented settings used in the original 1995 simulations.
-
-The relative-velocity prediction is now implemented in NetLogo and enabled by
-default. The original 1995 prediction remains available by switching
-`relative-anticipation?` off before setup. The actual-velocity-only substitution
-remains diagnostic-only because it worsened the comparison above.
-
-The elliptical potential is not differentiable on the segment between another
-pedestrian's current and anticipated positions. Its gradient can be very large
-near the endpoints. The `1e-6 m` softening avoids division by zero but does not
-make `dt = 0.02` a validated integration step. The paper evolves preferred `w`
-and caps actual `v`; resetting `w` to `v` would change those equations. The
-paper also has no pedestrian body-radius exclusion. For a perfectly symmetric
-head-on pair at desired speed `1.34 m/s`, the stationary force balance is
-`d = 0.3 * ln(7 / 2.68) = 0.288 m`, smaller than our fixed circle diameter
-`0.4 m`. The paper's plotted circle diameters instead represent actual speed.
-These distinctions and the unspecified numerical integrator in the paper
-remain relevant when interpreting overlap and sideways motion. No additional
-pedestrian contact force or arbitrary force cap was introduced by this audit.
-
 ## Files
 
 - `Pedestrians.nlogox`: runnable hallway scenario: interface, documentation,
@@ -389,6 +106,9 @@ pedestrian contact force or arbitrary force cap was introduced by this audit.
 - `scenarios/Door.nlogox`, `scenarios/TrafficLight.nlogox`,
   `scenarios/Crossing.nlogox`: the other scenario models, each with its own
   Info tab and BehaviorSpace experiment.
+- `run-experiments.sh`: runs every BehaviorSpace experiment headless in one
+  command and writes the tables to `work/` (see *Scenarios and shared
+  modules* for arguments).
 - `tests/ScenarioChecks.java`: vertical, oblique and door-post wall contact;
   door waypoint and 0.8 m blocking; red-light stop without overshoot and
   green recovery; crossing exits; lane counting and the 1.5 m rule;

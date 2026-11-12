@@ -63,6 +63,7 @@ to go
   if horizontal-rate < 0 or vertical-rate < 0 [error "Arrival rates must not be negative."]
   repeat random-poisson (horizontal-rate * dt) [spawn-walker false]
   repeat random-poisson (vertical-rate * dt) [spawn-walker true]
+  foreach sort pedestrians [p -> ask p [reroute-if-displaced]]
   ped-step
   if run-checks? [checks-update]
   log-row
@@ -107,6 +108,25 @@ to spawn-walker [is-vertical?]
     set free-time vector-length (goal-x - xcor) (goal-y - ycor) / desired-speed
   ]
   set spawned-count spawned-count + 1
+end
+
+; Crowd pressure in the shared square can push a walker out of its own
+; corridor band into an arm of the other corridor. From there the straight
+; line to its goal runs into a wall, and steering straight at the goal pins
+; it against that wall. While displaced, it heads for its own corridor's
+; centre line inside the square instead; the detour ends once it is back
+; inside its band by a margin (hysteresis avoids flickering at the edge).
+to reroute-if-displaced
+  let offset ifelse-value vertical? [abs (xcor - center)] [abs (ycor - center)]
+  let margin min (list 0.5 (half-width / 2))
+  if offset > half-width [
+    let lo center - half-width + margin
+    let hi center + half-width - margin
+    set waypoints ifelse-value vertical?
+      [(list (list center (max (list lo min (list hi ycor)))))]
+      [(list (list (max (list lo min (list hi xcor))) center))]
+  ]
+  if offset < half-width - margin [set waypoints []]
 end
 
 ; A position across a corridor, 0.5 m clear of its walls.
@@ -237,6 +257,17 @@ whether pedestrians get through without stopping.
 
 Compare with `vertical-rate` = 0 (no crossing traffic): the
 `crossing-flow-sweep` experiment does this.
+
+## DISPLACED WALKERS
+
+Pedestrians steer straight at their goal. In a crowded square, someone can be
+pushed out of their own corridor into an arm of the other corridor; the
+straight line to the goal then runs into a wall and they would stay pinned
+against it. While a walker is outside its own corridor band it therefore
+heads for its corridor's centre line inside the square first, and resumes
+heading for its goal once it is back inside the band by
+min(0.5 m, corridor-width / 4). Walkers inside their own corridor are never
+affected.
 
 ## SHARED MODEL
 

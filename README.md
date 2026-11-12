@@ -120,6 +120,10 @@ time) rises only from 1.036 to 1.056 for horizontal walkers. Fewer than 0.5 %
 of arrivals ever stop. There are no pass-throughs, and the closest any two
 people got was 0.35 m. At these flows pedestrians cross without stopping.
 Higher rates or narrower corridors are needed to see congestion.
+In such crowded runs, walkers pushed into the other corridor's arm used to
+stay pinned against its wall, because they steer straight at a goal behind
+it. A displaced walker now first heads back to its own corridor's centre
+line (see the model's Info tab, `ScenarioChecks`).
 
 **Relative-velocity anticipation is now the default.** The switch
 `relative-anticipation?` selects the pair prediction on **setup**:

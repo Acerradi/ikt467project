@@ -175,6 +175,9 @@ end
 to check-invariants
   if wall-penetration-count > 0 [error (word "Wall penetrated at t = " elapsed-seconds)]
   if speed-cap-violation-count > 0 [error (word "Speed cap exceeded at t = " elapsed-seconds)]
+  if pair-contact-enabled? and
+    min (list min-pair-separation swept-min-pair-separation) < minimum-separation - check-tolerance
+    [error (word "Minimum pedestrian separation violated at t = " elapsed-seconds)]
 end
 
 ; ---------------------------------------------------------------- lanes

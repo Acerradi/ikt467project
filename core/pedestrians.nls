@@ -10,7 +10,7 @@
 ;   relative-anticipation?, show-trails?
 ;
 ; Required hook. Every including model must define this procedure. It runs in
-; pedestrian context inside calculate-next-state, after the goal-disk test,
+; pedestrian context inside finalize-next-state, after joint contact and the goal-disk test,
 ; and may set reached-goal? (left successfully) or returned? (left backwards)
 ; from the buffered next-x/next-y:
 ;   to scenario-exit-check ... end
@@ -90,12 +90,19 @@ to ped-init-constants
   set last-step-paths []
   set last-step-start-seconds 0
   set last-step-duration 0
+  contact-init
 end
 
 ; True when a new pedestrian centred at (px, py) keeps entrance-clearance
 ; from everyone already present (periodic-aware).
 to-report ped-clear-at? [px py]
-  report not any? pedestrians with [separation-from px py < entrance-clearance]
+  let clearance placement-clearance
+  report not any? pedestrians with [separation-from px py < clearance]
+end
+
+to-report placement-clearance
+  if not pair-contact-enabled? [report entrance-clearance]
+  report max (list entrance-clearance minimum-separation)
 end
 
 to ped-check-parameters
@@ -107,11 +114,14 @@ end
 to ped-step
   set last-step-start-seconds elapsed-seconds
   set last-step-duration dt
-  ; Four separate passes ensure everyone uses the same time-t state.
+  ; Separate passes ensure everyone uses the same time-t state. Resolve contact
+  ; jointly on candidate paths before checking exits or committing any motion.
   ; Ordered passes also avoid introducing random ask order.
   foreach sort pedestrians [p -> ask p [update-desired-direction]]
   foreach sort pedestrians [p -> ask p [calculate-acceleration]]
-  foreach sort pedestrians [p -> ask p [calculate-next-state]]
+  foreach sort pedestrians [p -> ask p [propose-next-state]]
+  resolve-pedestrian-contacts
+  foreach sort pedestrians [p -> ask p [finalize-next-state]]
   ; Capture departures too: commit-next-state may remove them immediately.
   set last-step-paths map [p -> [(list who previous-x previous-y step-end-x step-end-y)] of p] sort pedestrians
   foreach sort pedestrians [p -> ask p [commit-next-state]]
@@ -287,6 +297,13 @@ end
 
 ; Equations (7), (8), (9). Write buffers, not the current state.
 to calculate-next-state
+  ; Single-pedestrian API used by the mathematical/boundary unit tests.
+  ; Production steps use the joint contact pass between these two procedures.
+  propose-next-state
+  finalize-next-state
+end
+
+to propose-next-state
   ; Also capture these when a diagnostic calls this procedure directly.
   set previous-x xcor
   set previous-y ycor
@@ -299,6 +316,11 @@ to calculate-next-state
   apply-wall-contact
   set step-end-x next-x
   set step-end-y next-y
+end
+
+; Runs once per pedestrian, after all contact-corrected endpoints are known.
+; Exit hooks can record arrivals, so they must never see a rejected proposal.
+to finalize-next-state
   if active-periodic? [
     set next-wrap-count abs (floor (next-x / hall-length))
     set next-x next-x mod hall-length

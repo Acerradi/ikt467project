@@ -2,8 +2,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import org.nlogo.headless.HeadlessWorkspace;
 
-/** Compare the production model with an independently solved saved encounter.
- * This verifies equations and replay, NOT collision-free behavior.
+/** Compare the unchanged soft-force model with an independently solved saved encounter.
+ * Pair contact is explicitly disabled: the saved state already has close
+ * overlaps, and the reference solver integrates the paper's forces alone.
+ * Hard-contact behavior is covered by SeparationChecks and the scenario suite.
  */
 public class EncounterChecks {
     private static HeadlessWorkspace world;
@@ -24,7 +26,7 @@ public class EncounterChecks {
         var columns = rows.get(0).split(",");
         world.command("set periodic? true set population " + (rows.size() - 1)
             + " set relative-anticipation? " + relative + " set dt 0.02 set noise-strength 0 "
-            + "setup set elapsed-seconds 20.52");
+            + "setup set pair-contact-enabled? false set elapsed-seconds 20.52");
         for (String row : rows.subList(1, rows.size())) {
             var values = row.split(",");
             var command = new StringBuilder("ask pedestrian ")
@@ -53,7 +55,7 @@ public class EncounterChecks {
             close("[ycor] of pedestrian 3", 5.394641734349123, 1e-8);
             close("[xcor] of pedestrian 52", 42.63779842075603, 1e-8);
             close("[ycor] of pedestrian 52", 5.600796601852353, 1e-8);
-            System.out.println("PASS: original-anticipation forces and replay match the independent solver.");
+            System.out.println("PASS: contact-disabled original-anticipation forces and replay match the independent solver.");
 
             // Start from the identical complete crowd state, changing only anticipation.
             restoreFixture(true);
@@ -72,9 +74,9 @@ public class EncounterChecks {
                 throw new AssertionError("Relative-anticipation encounter clearance differs from independent reference: "
                     + closest);
             }
-            System.out.println("PASS: relative-anticipation replay matches independent solver; "
+            System.out.println("PASS: contact-disabled relative-anticipation replay matches independent solver; "
                 + "previously colliding pair stays " + closest + " m apart.");
-            System.out.println("LIMITATION: this verifies one encounter, not collision-free behavior in every crowd.");
+            System.out.println("SCOPE: this validates the unchanged soft-force equations; it does not exercise the added contact constraint.");
         } finally {
             world.dispose();
         }

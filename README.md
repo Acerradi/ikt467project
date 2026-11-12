@@ -18,7 +18,7 @@ The pedestrian model is a module that each scenario includes:
 | `scenarios/Crossing.nlogox` | Horizontal and vertical corridors crossing at right angles |
 
 Each model starts with, for example,
-`__includes [ "../core/pedestrians.nls" "../core/checks.nls" "../core/stats.nls" ]`
+`__includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]`
 and owns only its geometry, spawning, `setup` and `go`:
 
 - `core/pedestrians.nls`: forces, integration and walls. Geometry is data: any
@@ -32,6 +32,37 @@ and owns only its geometry, spawning, `setup` and `go`:
 - `core/stats.nls`: mean, standard deviation and variance (sample and
   population), plotting helpers and CSV logging on the first completed step
   at or after each 0.1 s boundary, timestamped with its actual elapsed time.
+
+### Minimum pedestrian separation
+
+All four scenarios now enforce **0.5 m centre-to-centre separation**, including
+between ticks and across periodic seams. Initial/spawn clearance remains 0.6 m.
+The displayed radius and wall-contact radius remain 0.2 m, so the new pair
+constraint leaves a 0.1 m gap between the drawn circles at closest contact.
+
+`core/contact.nls` adds a hard geometric constraint after the ordinary
+social-force step. It projects only unsafe candidate motion onto joint
+pedestrian, wall, stop-line and speed constraints, seeking the smallest total
+squared displacement change. It checks the entire swept paths again after
+correction. It does not strengthen or replace the paper's repulsive potential.
+Unaffected proposals retain their original preferred and actual velocities.
+For corrected motion, velocity is displacement / dt and preferred velocity
+is set consistently with the same individual `v = cap(w)` relation. Arrival
+and door-passage decisions use the final corrected paths.
+
+This is an additional modelling assumption, not an equation from the original
+paper. All original force formulas and parameters remain unchanged. Crowds
+may queue or jam instead of passing through each other; a perfectly symmetric
+head-on pair need not spontaneously choose a passing side. The constraint
+is deterministic and does not add randomness.
+
+`pair-contact-enabled?` defaults to true and `minimum-separation` to 0.5 at
+setup. For a raw soft-model comparison only, use `set pair-contact-enabled?
+false` after setup in the command centre. The saved independent-solver replay
+does this explicitly because its starting fixture already overlaps. Normal
+production tests require the constraint to remain enabled. Invalid manual
+placements closer than the minimum are rejected. `contact-solver-fallbacks`
+reports any step where the bounded solver had to use a safe stopped state.
 
 Each model has a `run-checks?` switch, check monitors, plots and a BehaviorSpace
 experiment. The door, traffic-light and crossing models also have `log-csv?`
@@ -64,7 +95,8 @@ scenario additions to the social-force equations, not terms from the paper.
 - Pass-through detection uses stored start/end paths in any direction,
   including periodic seams and pedestrians removed at exits. This diagnostic
   uses a closest centre distance below 0.2 m; ordinary circle overlap is
-  measured separately below 0.4 m. Soft pair forces still permit overlaps.
+  measured separately below 0.4 m. The added 0.5 m constraint prevents both
+  in ordinary runs; the raw soft force law alone permits them.
 
 `WallContactChecks`, `DiagnosticsChecks` and `ScenarioRegressionChecks` cover
 these regressions. The last suite includes bounded crowd runs in all four
@@ -140,7 +172,8 @@ This is a single relative-velocity extension from
 not the complete calibrated later model. The ellipse, exponential potential,
 analytic gradient, perception weighting, preferred/actual velocity distinction,
 wall forces and previous parameter values are retained. The interaction is
-still soft; this extension does not guarantee nonoverlapping physical bodies.
+still soft; the separate minimum-separation constraint now provides the hard
+clearance that this anticipation extension alone does not guarantee.
 
 The hallway has two boundary modes. Choose `periodic?`, then click **setup**.
 The active-mode monitor shows which mode is running. Orange pedestrians walk
@@ -212,7 +245,8 @@ and desired-speed SD monitors show the current population's sample statistics,
 which will differ slightly from the configured distribution parameters.
 
 Read the model's **Info** tab for the equation mapping, parameters and numerical
-choices. Pedestrian repulsion is soft, so circles can overlap. The two hallway
+choices. Pedestrian repulsion is soft; the separate contact constraint keeps
+centres at least 0.5 m apart. The two hallway
 walls additionally enforce solid contact: centres remain at least `0.2` m from
 the walls. The preferred velocity into a wall is removed, its tangential
 component is retained, and actual velocity is recalculated from the paper's
@@ -236,6 +270,10 @@ The default periodic mode is covered separately by fixed-population tests.
 ## Mathematical audit and original-model diagnosis
 
 ### Validation of the implemented relative option
+
+The comparisons in this mathematical-audit section predate the hard 0.5 m
+pair constraint. They describe the soft model and its prediction options;
+they are not current constrained-crowd results.
 
 The actual NetLogo model was tested for 60 simulated seconds in both modes
 with seeds 42, 1 and 7: six completed runs, each with 150 pedestrians in the
@@ -370,14 +408,15 @@ head-on pair at desired speed `1.34 m/s`, the stationary force balance is
 `d = 0.3 * ln(7 / 2.68) = 0.288 m`, smaller than our fixed circle diameter
 `0.4 m`. The paper's plotted circle diameters instead represent actual speed.
 These distinctions and the unspecified numerical integrator in the paper
-remain relevant when interpreting overlap and sideways motion. No additional
-pedestrian contact force or arbitrary force cap was introduced by this audit.
+remain relevant when interpreting the historical overlap and sideways motion.
+That audit did not add a pedestrian contact force or arbitrary force cap.
+The subsequent 0.5 m geometric constraint is described above.
 
 ## Files
 
 - `Pedestrians.nlogox`: runnable hallway scenario: interface, documentation,
   and the hallway-specific `setup`, `go` and spawning code. It loads the shared
-  model with `__includes [ "core/pedestrians.nls" ]`.
+  model with the four shared `core/*.nls` includes.
 - `core/pedestrians.nls`: the shared pedestrian model (breed, state, forces,
   integration, general wall contact, waypoints, stop lines). It defines no
   `setup`/`go`; scenarios call `ped-init-constants`, `ped-check-parameters`
@@ -386,6 +425,11 @@ pedestrian contact force or arbitrary force cap was introduced by this audit.
   opens as a separate code tab and is the only copy of this code.
 - `core/checks.nls`, `core/stats.nls`: shared correctness checks and
   statistics/plotting/logging (see *Scenarios and shared modules*).
+- `core/contact.nls`: joint deterministic contact projection, 0.5 m pair
+  clearance, swept paths, periodic images and consistent corrected velocities.
+- `tests/SeparationChecks.java`: independent Java swept-distance checks,
+  head-on/oblique/periodic encounters, coupled walls and stop lines, creation
+  order, corrected arrivals, free-motion preservation and timestep sensitivity.
 - `scenarios/Door.nlogox`, `scenarios/TrafficLight.nlogox`,
   `scenarios/Crossing.nlogox`: the other scenario models, each with its own
   Info tab and BehaviorSpace experiment.
@@ -445,7 +489,7 @@ $netLogoHome = 'C:\Program Files\NetLogo 7.0.4'
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/MathChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/EncounterChecks.java
 & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" tests/AnticipationChecks.java
-foreach ($suite in 'ScenarioChecks', 'WallContactChecks', 'DiagnosticsChecks', 'ScenarioRegressionChecks') {
+foreach ($suite in 'ScenarioChecks', 'WallContactChecks', 'SeparationChecks', 'DiagnosticsChecks', 'ScenarioRegressionChecks') {
   & "$netLogoHome\runtime\bin\java.exe" '-Djava.awt.headless=true' -classpath "$netLogoHome\app\netlogo-7.0.4.jar" "tests/$suite.java"
   if ($LASTEXITCODE -ne 0) { throw "$suite failed" }
 }
@@ -456,7 +500,7 @@ On Linux, with NetLogo installed in `/opt/NetLogo-7.0.4`:
 
 ```bash
 N=/opt/NetLogo-7.0.4
-for t in BoundaryChecks PeriodicChecks SpeedChecks MathChecks EncounterChecks AnticipationChecks ScenarioChecks WallContactChecks DiagnosticsChecks ScenarioRegressionChecks; do
+for t in BoundaryChecks PeriodicChecks SpeedChecks MathChecks EncounterChecks AnticipationChecks ScenarioChecks WallContactChecks SeparationChecks DiagnosticsChecks ScenarioRegressionChecks; do
   "$N/lib/runtime/bin/java" -Djava.awt.headless=true -classpath "$N/lib/app/netlogo-7.0.4.jar" tests/$t.java || break
 done
 ```

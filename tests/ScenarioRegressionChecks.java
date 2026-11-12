@@ -46,7 +46,10 @@ public class ScenarioRegressionChecks {
         + "if abs (last-step-start-seconds + last-step-duration - elapsed-seconds) > 1e-8 "
         + "[error \"Last-step path time does not match simulation time\"] "
         + "if length last-step-paths < count pedestrians [error \"Missing pedestrian motion paths\"] "
-        + "if swept-min-pair-separation < 0 [error \"Negative swept distance\"] ";
+        + "if not pair-contact-enabled? or abs (minimum-separation - 0.5) > 1e-12 "
+        + "[error \"Production contact defaults changed\"] "
+        + "if swept-min-pair-separation < 0.5 - 1e-8 or min-pair-separation < 0.5 - 1e-8 "
+        + "[error \"Pedestrians came closer than 0.5 metres\"] ";
 
     private static void lightTiming() throws Exception {
         open("scenarios/TrafficLight.nlogox");
@@ -117,7 +120,7 @@ public class ScenarioRegressionChecks {
             + "set door-width 2 set log-csv? false setup set potential-strength 0 set wall-strength 0 "
             + "add-pedestrian 9.99 4.0 1 add-pedestrian 9.95 4.5 1 add-pedestrian 10.03 5.0 -1 "
             + "ask pedestrians [set waypoints [] set goal-y ycor set wx 1.34 * travel-direction set vx wx]");
-        require("min-pair-separation > 2 * body-radius", "Passage-order fixture starts overlapped");
+        require("min-pair-separation >= minimum-separation", "Passage-order fixture starts below required clearance");
         world.command("go");
         require("door-sequence = [1 -1 1]", "Door sequence uses pedestrian ID instead of crossing time");
         near("alternation-fraction", 1, 0, "Door alternation differs from chronological crossings");
@@ -171,6 +174,10 @@ public class ScenarioRegressionChecks {
                 near("elapsed-seconds", steps * .02, 1e-7, "Stress duration changed");
                 require("speed-cap-violations = 0 and worst-wall-clearance >= body-radius - 1e-8",
                     "Crowd violated speed or wall constraints");
+                require("worst-min-separation >= 0.5 - 1e-8 and pass-through-events = 0",
+                    "Crowd violated the minimum pedestrian separation during a step");
+                require("contact-solver-fallbacks = 0",
+                    "Crowd needed the contact solver's safe-stop fallback");
                 if (model.contains("TrafficLight")) {
                     require("held-on-road-count = 0 and max-stop-overshoot <= 1e-9",
                         "Crowd pressure pushed a held pedestrian over the stop boundary");
@@ -182,10 +189,10 @@ public class ScenarioRegressionChecks {
                         "Crossing direction-specific arrival records do not conserve arrivals");
                 }
                 System.out.println("PASS bounded crowd: " + model + ", relative=" + relative + ", "
-                    + world.report("(list elapsed-seconds count pedestrians arrived-count returned-count pass-through-events worst-min-separation)"));
+                    + world.report("(list elapsed-seconds count pedestrians arrived-count returned-count pass-through-events worst-min-separation contact-step-count contact-solver-fallbacks)"));
             }
         }
-        System.out.println("LIMITATION: soft pedestrian-pedestrian forces can still allow overlaps; these tests do not assert collision-free crowds.");
+        System.out.println("PASS: the added contact constraint preserves 0.5 m minimum separation throughout all bounded crowd runs.");
     }
 
     public static void main(String[] args) throws Exception {

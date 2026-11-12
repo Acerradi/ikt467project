@@ -81,10 +81,10 @@ public class DiagnosticsChecks {
         // Real integration: both walkers reach their exit disks and die at commit.
         world.command("set periodic? false set spawn-rate 0 set dt .02 set desired-speed-sd 0 setup "
             + "create-pedestrians 1 [initialize-pedestrian 48.99 6 49 6 1 set wx 1.34 set vx 1.34] "
-            + "create-pedestrians 1 [initialize-pedestrian 48.99 6.1 49 6.1 1 set wx 1.34 set vx 1.34] go");
+            + "create-pedestrians 1 [initialize-pedestrian 48.99 6.6 49 6.6 1 set wx 1.34 set vx 1.34] go");
         require("count pedestrians = 0 and length last-step-paths = 2 and arrived-count = 2",
             "Core must capture paths before removing arrivals");
-        require("swept-min-pair-separation < 0.11", "Removed pair lost from closest-distance check");
+        require("swept-min-pair-separation < 0.61", "Removed pair lost from closest-distance check");
         close(number("last-step-start-seconds"), 0, 0, "Recorded step start");
         close(number("last-step-duration"), .02, 0, "Recorded step duration");
         System.out.println("PASS: rotated passes, persistent overlap, periodic images and departed-agent snapshots.");

@@ -10,7 +10,7 @@
 ; run-checks?, log-csv?, switch-time, start-green?, road-width,
 ; walkway-width, spawn-rate, initial-per-side.
 
-__includes [ "../core/pedestrians.nls" "../core/checks.nls" "../core/stats.nls" ]
+__includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
 
 globals [
   road-left road-right    ; road edges (curbs), metres
@@ -297,15 +297,18 @@ stay near zero; on green the speed ratio returns to about 1.
 Forces, integration and walls come from `../core/pedestrians.nls`; correctness
 checks from `../core/checks.nls`; statistics, plots and CSV logging from
 `../core/stats.nls`. Every wall segment exerts the paper's wall force and is
-impenetrable (centres stay `body-radius` = 0.2 m away).
+impenetrable (centres stay `body-radius` = 0.2 m away). `../core/contact.nls`
+adds a joint hard 0.5 m centre-to-centre constraint along the whole step.
+This supplements the unchanged social forces and may produce queues or jams.
 
 ## CORRECTNESS CHECKS
 
-With `run-checks?` on, every step updates: `pass-throughs` (pairs that swapped
-order while their centres were within one body radius sideways, i.e. walked
-through each other), `min separation seen`, the closest approach to any wall
+With `run-checks?` on, every step updates: `pass-throughs` (deep swept closest
+approaches below 0.2 m in any direction), `min separation seen`, wall clearance
 and speed-cap violations (|v| > 1.3 v0). `overlapping pairs` counts drawn
-circles overlapping now. Pair repulsion is soft, so small overlaps can occur.
+circles overlapping now. With the default pair constraint enabled, minimum
+separation stays at least 0.5 m within numerical tolerance and both counts
+remain zero. `contact-solver-fallbacks` counts safe stops if the solver stalls.
 
 ## LOGGING
 

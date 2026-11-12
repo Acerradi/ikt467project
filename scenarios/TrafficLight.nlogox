@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[; Traffic-light scenario: a walkway crossed by a road with a pedestrian light.
+  <code><![CDATA[; =============================================================================
+; scenarios/TrafficLight.nlogox -- traffic-light scenario
+; =============================================================================
+; Traffic-light scenario: a walkway crossed by a road with a pedestrian light.
 ; While the light is red, pedestrians who have not reached their curb brake
 ; to a stop at it; when it turns green they continue. Pedestrians already on
 ; the road when it turns red finish crossing.
@@ -9,6 +12,14 @@
 ; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
 ; run-checks?, log-csv?, switch-time, start-green?, road-width,
 ; walkway-width, spawn-rate, initial-per-side.
+;
+; Geometry (metres): a 40 m long walkway, walkway-width wide, with a road of
+; road-width centred at x = 20 (light grey). No cars are modelled; the road
+; only defines where the curbs (stop lines) are.
+;
+; The light switches colour every switch-time simulated seconds. A red light
+; gives each pedestrian still before its curb a stop-x: the core then brakes
+; it smoothly towards that line and never lets its centre cross it.
 
 __includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
 
@@ -20,6 +31,7 @@ globals [
   max-stop-overshoot      ; furthest a held pedestrian got past its stop line (m)
 ]
 
+; Build the walkway and road, set the light and place both initial crowds.
 to setup
   clear-all
   ped-init-constants
@@ -37,6 +49,7 @@ to setup
   set-topology false false
   set wall-segments (list (list 0 hall-bottom hall-length hall-bottom)
                           (list 0 hall-top hall-length hall-top))
+  ; White sidewalk, light grey road, dark grey outside the walls.
   ask patches [
     set pcolor white
     if pxcor >= road-left and pxcor <= road-right [set pcolor gray + 2]
@@ -49,16 +62,20 @@ to setup
   set max-stop-overshoot 0
   draw-light
   random-seed simulation-seed
+  ; Both directions start on their own sidewalk.
   place-initial-crowd 1
   place-initial-crowd -1
   if log-csv? [log-start "../work/traffic-light.csv"]
   reset-ticks
 end
 
+; Advance the simulation by dt seconds. If the light changes inside this
+; interval, the interval is split into substeps at the exact switch time.
 to go
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
   if switch-time <= 0 [error "switch-time must be positive."]
+  ; dt is temporarily shortened for substeps below and restored at the end.
   let requested-dt dt
   let finish-time elapsed-seconds + requested-dt
   repeat random-poisson (spawn-rate * requested-dt) [spawn-at-entrance]
@@ -67,6 +84,7 @@ to go
   ; update synchronously within each substep.
   update-light
   while [elapsed-seconds < finish-time - 1e-10] [
+    ; Step to whichever comes first: the end of dt or the next light switch.
     set dt min (list (finish-time - elapsed-seconds) (switch-time - light-timer))
     ped-step
     set light-timer light-timer + dt
@@ -79,11 +97,15 @@ to go
 end
 
 ; Hook required by core/pedestrians.nls.
+; Leave through the far exit plane; pushed back through the entrance = returned.
 to scenario-exit-check
   x-walkway-exit-check
 end
 
+; Switch the light when its timer has run out, then give or remove stop lines.
 to update-light
+  ; A while loop (not if) handles several switches in one call; the timer
+  ; keeps its remainder so the cycle never drifts.
   while [light-timer >= switch-time - 1e-10] [
     set light-green? not light-green?
     set light-timer max (list 0 (light-timer - switch-time))
@@ -110,6 +132,8 @@ to-report gap-to-stop-line  ; pedestrian reporter
   report (own-stop-line - xcor) * travel-direction
 end
 
+; Correctness check: how far past its stop line any held pedestrian has got.
+; Should stay 0 (the core enforces the line as a hard boundary).
 to track-stop-lines
   foreach sort (pedestrians with [is-number? stop-x]) [p -> ask p [
     set max-stop-overshoot max (list max-stop-overshoot (- gap-to-stop-line))
@@ -123,6 +147,7 @@ to draw-light
     [p -> ask p [set pcolor ifelse-value light-green? [green] [red]]]
 end
 
+; initial-per-side pedestrians scattered over one sidewalk.
 to place-initial-crowd [direction]
   ; Each direction starts on its own sidewalk, before the road.
   let low ifelse-value (direction = 1) [open-left + 0.5] [road-right + 1]
@@ -135,6 +160,7 @@ to place-initial-crowd [direction]
   ]
 end
 
+; Create one arrival at a random end, if there is room for it.
 to spawn-at-entrance
   let direction ifelse-value (random 2 = 0) [1] [-1]
   let entrance-x ifelse-value (direction = 1) [open-left] [open-right]
@@ -144,10 +170,13 @@ to spawn-at-entrance
     [add-pedestrian item 0 spot item 1 spot direction]
 end
 
+; Random y inside the walkway, at least 0.75 m from either wall.
 to-report random-walkway-y
   report random-between (hall-bottom + 0.75) (hall-top - 0.75)
 end
 
+; A pedestrian walking to the far exit at a random y. Stop lines are given
+; by update-light, not here.
 to add-pedestrian [x y direction]
   let target-y random-walkway-y
   create-pedestrians 1 [
@@ -157,6 +186,7 @@ to add-pedestrian [x y direction]
   set spawned-count spawned-count + 1
 end
 
+; "green" or "red", for the interface monitor.
 to-report light-colour
   report ifelse-value light-green? ["green"] ["red"]
 end

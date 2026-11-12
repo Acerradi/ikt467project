@@ -1,15 +1,33 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[; Hallway scenario: open arrivals or a fixed population with periodic ends.
+  <code><![CDATA[; =============================================================================
+; Pedestrians.nlogox -- hallway scenario
+; =============================================================================
+; Hallway scenario: open arrivals or a fixed population with periodic ends.
 ; The shared pedestrian model lives in core/pedestrians.nls.
 ; Interface variables: spawn-rate, dt, mean-desired-speed, desired-speed-sd,
 ; noise-strength, simulation-seed, show-trails?, periodic?, population,
 ; relative-anticipation?, hall-width, run-checks?.
+;
+; Two modes, chosen by the periodic? switch at setup:
+;   open      pedestrians arrive at random at either end (Poisson process,
+;             spawn-rate per second in total), walk to a random point on the
+;             opposite end and are removed when they cross its exit plane.
+;   periodic  a fixed population of `population` pedestrians, half walking
+;             each way; the left and right ends are joined, so whoever walks
+;             out on one side re-enters on the other. Used for the lane
+;             formation experiment (Figure 3 of Helbing & Molnar), where the
+;             density must stay constant.
+;
+; Geometry (metres): a 50 m long hallway, hall-width wide, with walls at
+; y = hall-bottom (1.5) and y = hall-top. Exit planes at x = 1 and x = 49.
 
 __includes [ "core/pedestrians.nls" "core/contact.nls" "core/checks.nls" "core/stats.nls" ]
 
+; Build the hallway, reset all modules and (periodic mode) place the population.
 to setup
   clear-all
+  ; Shared-module initialisation: constants, checks and statistics.
   ped-init-constants
   checks-reset
   stats-reset
@@ -19,7 +37,10 @@ to setup
   set hall-length 50
   set open-left 1
   set open-right hall-length - 1
+  ; One patch = 1 m. Leave a 1.5 m grey margin above the top wall.
   resize-world 0 hall-length 0 (ceiling (hall-top + 1.5))
+  ; NetLogo's own world wrapping stays off; periodicity is handled by the
+  ; model (periodic-delta-x and finalize-next-state) with period hall-length.
   set-topology false false
   set active-periodic? periodic? ; boundary mode changes take effect on setup
 
@@ -27,6 +48,8 @@ to setup
   ; Grey patches end at y=1.5 and begin at y=11.5.
   set wall-segments (list (list 0 hall-bottom hall-length hall-bottom)
                            (list 0 hall-top hall-length hall-top))
+  ; Colours: white walkway, dark grey outside the walls, light green exit
+  ; columns (open mode only).
   ask patches [
     set pcolor white
     if pycor < hall-bottom or pycor > hall-top [set pcolor gray - 2]
@@ -41,6 +64,8 @@ to setup
   reset-ticks
 end
 
+; One integration step of length dt: spawn arrivals (open mode), move
+; everyone, then update the optional correctness checks.
 to go
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
@@ -56,6 +81,7 @@ to go
 end
 
 ; Hook required by core/pedestrians.nls (pedestrian context, buffered state).
+; Decides from next-x whether the pedestrian leaves the hallway this step.
 to scenario-exit-check
   ; The whole open end is an exit. A pedestrian need not hit the exact goal disk.
   ; Keep the fixed random goal as the steering target, but remove on crossing
@@ -68,6 +94,7 @@ to scenario-exit-check
                  (goal-x = open-left and next-x > open-right))
 end
 
+; Open mode: try to create one pedestrian at a random end.
 to spawn-pedestrian
   if active-periodic? [stop]   ; no births during a periodic run
   ; Choose an end with equal probability, then a uniform position across its width.
@@ -75,6 +102,8 @@ to spawn-pedestrian
   let entrance-y 0
   let placed? false
   let attempts 0
+  ; Up to 20 random positions across the entrance; each must keep the
+  ; required clearance from everyone already there.
   while [not placed? and attempts < 20] [
     set entrance-y random-hallway-y
     set placed? ped-clear-at? entrance-x entrance-y
@@ -86,6 +115,8 @@ to spawn-pedestrian
     stop
   ]
 
+  ; Goal: the opposite exit plane (hall-length - 1 or 1) at a new random y.
+  ; Direction +1 when entering on the left, -1 when entering on the right.
   create-pedestrians 1 [
     initialize-pedestrian entrance-x entrance-y (hall-length - entrance-x)
       random-hallway-y (ifelse-value (entrance-x = open-left) [1] [-1])
@@ -93,6 +124,8 @@ to spawn-pedestrian
   set spawned-count spawned-count + 1
 end
 
+; Periodic mode: place `population` pedestrians at random, non-overlapping
+; positions anywhere in the hallway.
 to setup-periodic-population
   ; Uniform positions, balanced directions, no prescribed lanes or passing side.
   repeat population [
@@ -108,7 +141,10 @@ to setup-periodic-population
     ]
     if not placed? [error "Could not place the periodic population with clearance. Reduce population."]
     create-pedestrians 1 [
+      ; Even who numbers walk right, odd ones walk left: exactly balanced.
       let assigned-direction ifelse-value (who mod 2 = 0) [1] [-1]
+      ; The goal is only nominal here: update-desired-direction ignores it
+      ; in periodic mode and walks along travel-direction instead.
       initialize-pedestrian initial-x initial-y
         (ifelse-value (assigned-direction = 1) [hall-length] [0])
         initial-y assigned-direction
@@ -117,11 +153,13 @@ to setup-periodic-population
   ]
 end
 
+; Random y inside the hallway, at least 0.75 m from either wall.
 to-report random-hallway-y
   ; Keep the same 0.75 m initial margin at each wall, for any hallway width.
   report hall-bottom + 0.75 + random-float (hall-top - hall-bottom - 1.5)
 end
 
+; Pedestrians per square metre of walkway (0.3 in the Figure 3 experiment).
 to-report pedestrian-density
   if hall-length <= 0 or hall-top <= hall-bottom [report 0]
   report count pedestrians / (hall-length * (hall-top - hall-bottom))

@@ -1,3 +1,6 @@
+; =============================================================================
+; core/stats.nls -- statistics, plotting and CSV logging
+; =============================================================================
 ; Statistics, plotting and CSV logging shared by all scenarios.
 ; Requires core/pedestrians.nls.
 ;
@@ -9,6 +12,9 @@
 ; give a plot three pens named "mean", "+sd" and "-sd" and use e.g.
 ;   plot-mean-sd speeds
 ; as the plot's update command.
+;
+; Nothing here uses random numbers or changes pedestrians, so plotting and
+; logging never alter a simulation run.
 
 globals [
   log-file                 ; current CSV file name, or "" when not logging
@@ -16,6 +22,7 @@ globals [
   last-logged-seconds      ; prevents duplicate rows from repeated calls in one step
 ]
 
+; Defaults; call in setup. Samples every 0.1 simulated seconds, no log open.
 to stats-reset
   set log-file ""
   set stats-interval 0.1
@@ -26,9 +33,15 @@ end
 ; its actual elapsed time; no interpolation is implied. For dt=.03 and an
 ; interval of .1 this gives .12, .21, .30, ... instead of drifting by .09.
 ; This reporter is idempotent so plot and CSV callers see the same decision.
+;
+; The last step covered [start, start + duration]. It is a sample step when
+; that interval contains a multiple of stats-interval, i.e. when the interval
+; index floor(t / stats-interval) increased during the step. The tiny slack
+; stops floating-point round-off (e.g. 0.30000000000000004) from moving a
+; boundary into the wrong step.
 to-report stats-sample?
   if stats-interval <= 0 [error "stats-interval must be positive."]
-  if elapsed-seconds = 0 [report true]
+  if elapsed-seconds = 0 [report true]       ; always sample the initial state
   if last-step-duration <= 0 [report false]
   let time-slack 1e-10 * stats-interval
   report floor ((last-step-start-seconds + last-step-duration + time-slack) / stats-interval) >
@@ -36,22 +49,27 @@ to-report stats-sample?
 end
 
 ; ---------------------------------------------------------------- numbers
+; Safe wrappers around NetLogo's built-ins: they report 0 instead of raising
+; an error for lists that are too short.
 
 to-report stat-mean [xs]
   if empty? xs [report 0]
   report mean xs
 end
 
+; Sample variance (divide by n - 1); 0 for fewer than two values.
 to-report stat-variance [xs]
   if length xs < 2 [report 0]
   report variance xs
 end
 
+; Sample standard deviation; 0 for fewer than two values.
 to-report stat-sd [xs]
   if length xs < 2 [report 0]
   report standard-deviation xs
 end
 
+; Population variance (divide by n); 0 for an empty list.
 to-report stat-population-variance [xs]
   if empty? xs [report 0]
   let m mean xs
@@ -64,6 +82,7 @@ to-report stat-summary [xs]
 end
 
 ; ---------------------------------------------------------------- quantities
+; Each reporter lists one value per pedestrian, in who order.
 
 ; Current speed |v| of every pedestrian (m/s).
 to-report speeds
@@ -81,6 +100,7 @@ to-report forward-speeds
 end
 
 ; Sideways speed relative to e (m/s).
+; |v x e| (2D cross product) is the velocity component perpendicular to e.
 to-report lateral-speeds
   report map [p -> [abs (vy * ex - vx * ey)] of p] sort pedestrians
 end
@@ -101,6 +121,7 @@ end
 ; ---------------------------------------------------------------- plotting
 
 ; Plot mean and mean +/- one SD of xs against simulated time on the current plot.
+; Only plots on sampling steps, so the plot has one point per stats-interval.
 to plot-mean-sd [xs]
   if empty? xs or not stats-sample? [stop]
   let m stat-mean xs
@@ -116,12 +137,14 @@ end
 ; ---------------------------------------------------------------- CSV log
 
 ; Start a CSV file (overwritten), sampled on steps crossing interval boundaries.
+; Writes the header row; each later row is written by log-row.
 to log-start [file-name]
   log-stop
   if file-exists? file-name [file-delete file-name]
   set log-file file-name
   set last-logged-seconds -1
   file-open log-file
+  ; Columns: time, population counts, then mean/sd/var of each quantity.
   file-print (word "time_s,walking,arrived,"
     "speed_mean,speed_sd,speed_var,"
     "speed_ratio_mean,speed_ratio_sd,speed_ratio_var,"
@@ -132,9 +155,12 @@ to log-start [file-name]
 end
 
 ; Append one row if a log is open and this is a sampling step.
+; The file is opened and closed per row, so the CSV is always complete on
+; disk even if the run is interrupted.
 to log-row
   if log-file = "" or not stats-sample? or elapsed-seconds = last-logged-seconds [stop]
   file-open log-file
+  ; but-last drops n from each [mean sd variance n] summary.
   file-print csv-row (sentence elapsed-seconds count pedestrians arrived-count
     but-last stat-summary speeds
     but-last stat-summary speed-ratios
@@ -146,11 +172,13 @@ to log-row
   set last-logged-seconds elapsed-seconds
 end
 
+; Stop logging. Safe to call when no log is open.
 to log-stop
   if is-string? log-file and log-file != "" [carefully [file-close] []]
   set log-file ""
 end
 
+; Join a list of values with commas: [1 2 3] -> "1,2,3".
 to-report csv-row [values]
   report reduce [[a b] -> (word a "," b)] values
 end

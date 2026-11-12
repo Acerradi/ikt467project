@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[; Crossing scenario: two corridors cross at right angles. Pedestrians walk
+  <code><![CDATA[; =============================================================================
+; scenarios/Crossing.nlogox -- crossing scenario
+; =============================================================================
+; Crossing scenario: two corridors cross at right angles. Pedestrians walk
 ; horizontally and vertically through the shared square. The crossing is not
 ; an object: it emerges from where the walls and the flows are placed.
 ; Shared model: ../core/pedestrians.nls.
@@ -8,6 +11,14 @@
 ; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
 ; run-checks?, log-csv?, corridor-width, horizontal-rate, vertical-rate,
 ; two-way?.
+;
+; Geometry (metres): a 30 x 30 m world. A horizontal and a vertical corridor,
+; each corridor-width wide, cross in a square centred at (15, 15). Exit
+; planes at 1 and 29 on both axes.
+;
+; Measured per arrival: travel time, free-walking time (straight-line
+; distance / desired speed) and time spent standing, so the delay caused by
+; the crossing can be compared between the two flows.
 
 __includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
 
@@ -23,6 +34,7 @@ turtles-own [
   free-time               ; straight-line distance / desired speed at creation
 ]
 
+; Build the plus-shaped walkable area; no pedestrians exist at the start.
 to setup
   clear-all
   ped-init-constants
@@ -39,6 +51,7 @@ to setup
   resize-world 0 hall-length 0 hall-length
   set-topology false false
   ; Four L-shaped corners bound a plus-shaped walkable area.
+  ; lo and hi are the corridor edges on both axes.
   let lo center - half-width
   let hi center + half-width
   set wall-segments (list
@@ -46,6 +59,7 @@ to setup
     (list hi lo hall-length lo) (list hi 0 hi lo)               ; bottom-right
     (list 0 hi lo hi) (list lo hi lo hall-length)               ; top-left
     (list hi hi hall-length hi) (list hi hi hi hall-length))    ; top-right
+  ; White inside either corridor, dark grey in the four corner blocks.
   ask patches [
     set pcolor ifelse-value ((pycor > lo and pycor < hi) or (pxcor > lo and pxcor < hi))
       [white] [gray - 2]
@@ -58,9 +72,12 @@ to setup
   reset-ticks
 end
 
+; One integration step: arrivals in both corridors, detours for displaced
+; walkers, motion, checks and logging.
 to go
   ped-check-parameters
   if horizontal-rate < 0 or vertical-rate < 0 [error "Arrival rates must not be negative."]
+  ; Independent Poisson arrivals for each corridor (rates per second).
   repeat random-poisson (horizontal-rate * dt) [spawn-walker false]
   repeat random-poisson (vertical-rate * dt) [spawn-walker true]
   foreach sort pedestrians [p -> ask p [reroute-if-displaced]]
@@ -70,6 +87,8 @@ to go
 end
 
 ; Hook required by core/pedestrians.nls.
+; Vertical walkers leave through the top/bottom exit planes, horizontal ones
+; through the left/right planes. Arrivals are recorded per corridor.
 to scenario-exit-check
   ifelse vertical? [
     if (travel-direction = 1 and next-y >= open-top) or
@@ -81,6 +100,7 @@ to scenario-exit-check
     x-walkway-exit-check
   ]
   if reached-goal? [
+    ; The arrival completes at the end of this step (elapsed-seconds + dt).
     let result (list (elapsed-seconds + dt - birth-seconds) free-time slow-seconds)
     ifelse vertical?
       [set vertical-results lput result vertical-results]
@@ -89,8 +109,11 @@ to scenario-exit-check
 end
 
 ; travel-direction is +1 for right/up and -1 for left/down.
+; Create one walker at the entrance of the horizontal or vertical corridor.
+; One-way: always right/up. Two-way: either direction with equal chance.
 to spawn-walker [is-vertical?]
   let direction ifelse-value (two-way? and random 2 = 0) [-1] [1]
+  ; start/finish are coordinates along the walking axis (x or y).
   let start ifelse-value (direction = 1) [open-left] [open-right]
   let finish ifelse-value (direction = 1) [open-right] [open-left]
   let spot try-place [-> ifelse-value is-vertical?
@@ -99,11 +122,13 @@ to spawn-walker [is-vertical?]
     set blocked-spawn-count blocked-spawn-count + 1
     stop
   ]
+  ; Goal: a new random position across the corridor at the far exit.
   let across random-across
   let goal ifelse-value is-vertical? [(list across finish)] [(list finish across)]
   create-pedestrians 1 [
     initialize-pedestrian item 0 spot item 1 spot item 0 goal item 1 goal direction
     set vertical? is-vertical?
+    ; Vertical walkers: green going up, violet going down.
     if vertical? [set color ifelse-value (direction = 1) [green - 1] [violet]]
     set free-time vector-length (goal-x - xcor) (goal-y - ycor) / desired-speed
   ]
@@ -117,9 +142,12 @@ end
 ; centre line inside the square instead; the detour ends once it is back
 ; inside its band by a margin (hysteresis avoids flickering at the edge).
 to reroute-if-displaced
+  ; Distance from the centre line of the walker's own corridor.
   let offset ifelse-value vertical? [abs (xcor - center)] [abs (ycor - center)]
   let margin min (list 0.5 (half-width / 2))
   if offset > half-width [
+    ; Waypoint: on the own centre line, at the current position along the
+    ; other axis clamped into the shared square.
     let lo center - half-width + margin
     let hi center + half-width - margin
     set waypoints ifelse-value vertical?
@@ -137,10 +165,12 @@ end
 ; ---------------------------------------------------------------- results
 ; group is "horizontal" or "vertical".
 
+; Raw [travel-time free-time slow-seconds] records of one group.
 to-report results-of [group]
   report ifelse-value (group = "vertical") [vertical-results] [horizontal-results]
 end
 
+; Travel times (s) of the arrived walkers of one group.
 to-report travel-times-of [group]
   report map [r -> item 0 r] results-of group
 end
@@ -157,6 +187,7 @@ to-report stopped-fraction-of [group]
   report length filter [r -> item 2 r > 0] results / length results
 end
 
+; The walkers of one group currently in the world.
 to-report walkers-of [group]
   report pedestrians with [vertical? = (group = "vertical")]
 end

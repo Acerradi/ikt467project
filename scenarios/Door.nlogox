@@ -1,12 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <model version="NetLogo 7.0.4" snapToGrid="true">
-  <code><![CDATA[; Door scenario: a corridor divided by a wall with one door opening.
+  <code><![CDATA[; =============================================================================
+; scenarios/Door.nlogox -- door scenario
+; =============================================================================
+; Door scenario: a corridor divided by a wall with one door opening.
 ; Pedestrians start on one or both sides and must pass the door to reach the
 ; far end. Shared model: ../core/pedestrians.nls (forces, integration, walls).
 ; Interface variables: dt, mean-desired-speed, desired-speed-sd,
 ; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
 ; run-checks?, log-csv?, door-width, room-width, initial-per-side,
 ; spawn-rate, two-sided?.
+;
+; Geometry (metres): a 20 m long corridor, room-width wide, walls at
+; y = hall-bottom (1.5) and y = hall-top. A dividing wall at x = 10 has a
+; door-width opening centred between the walls. Exit planes at x = 1 and 19.
+;
+; Steering: every pedestrian gets the middle of the door as a waypoint, so it
+; heads for the opening first and then for its goal on the far side.
+; Observations: the order of passages (door-sequence) shows whether the two
+; sides alternate or one side goes through in a block.
 
 __includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
 
@@ -18,6 +30,7 @@ globals [
 
 turtles-own [ door-side ]  ; -1 left of the door plane, +1 right of it
 
+; Build the corridor and door, then place the initial crowd(s).
 to setup
   clear-all
   ped-init-constants
@@ -34,6 +47,8 @@ to setup
   resize-world 0 hall-length 0 (ceiling (hall-top + 1.5))
   set-topology false false
   ; Two corridor walls and the dividing wall, interrupted by the door.
+  ; The two dividing-wall pieces end at the door posts; their end points act
+  ; as round posts in the hard wall contact.
   set wall-segments (list
     (list 0 hall-bottom hall-length hall-bottom)
     (list 0 hall-top hall-length hall-top)
@@ -42,34 +57,42 @@ to setup
   ask patches [
     set pcolor ifelse-value (pycor < hall-bottom or pycor > hall-top) [gray - 2] [white]
   ]
+  ; Patches are too coarse for the door, so walls are drawn as lines.
   draw-walls black
   set door-sequence []
   set emptied-seconds false
   random-seed simulation-seed
+  ; Right-walkers start left of the door; left-walkers (two-sided only) right.
   place-initial-crowd 1
   if two-sided? [place-initial-crowd -1]
   if log-csv? [log-start "../work/door.csv"]
   reset-ticks
 end
 
+; One integration step: arrivals, motion, door bookkeeping, checks, logging.
 to go
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
+  ; Poisson arrivals with mean spawn-rate per simulated second.
   repeat random-poisson (spawn-rate * dt) [spawn-at-entrance]
   ped-step
   track-door
   if run-checks? [checks-update]
   log-row
+  ; Record when the corridor first becomes empty (evacuation time).
   if emptied-seconds = false and spawned-count > 0 and not any? pedestrians
     [set emptied-seconds elapsed-seconds]
 end
 
 ; Hook required by core/pedestrians.nls.
+; Leave through the far exit plane; pushed back through the entrance = returned.
 to scenario-exit-check
   x-walkway-exit-check
 end
 
 ; initial-per-side pedestrians scattered over the side they start from.
+; direction +1: between the left exit and 1 m before the door;
+; direction -1: between 1 m after the door and the right exit.
 to place-initial-crowd [direction]
   let low ifelse-value (direction = 1) [open-left + 0.5] [door-x + 1]
   let high ifelse-value (direction = 1) [door-x - 1] [open-right - 0.5]
@@ -81,6 +104,8 @@ to place-initial-crowd [direction]
   ]
 end
 
+; Create one arrival at an entrance, if there is room for it.
+; One-sided: always from the left. Two-sided: either end with equal chance.
 to spawn-at-entrance
   let direction ifelse-value (two-sided? and random 2 = 0) [-1] [1]
   let entrance-x ifelse-value (direction = 1) [open-left] [open-right]
@@ -90,6 +115,7 @@ to spawn-at-entrance
     [add-pedestrian item 0 spot item 1 spot direction]
 end
 
+; Random y inside the corridor, at least 0.75 m from either wall.
 to-report random-room-y
   report random-between (hall-bottom + 0.75) (hall-top - 0.75)
 end
@@ -102,6 +128,7 @@ to add-pedestrian [x y direction]
       target-y direction
     set waypoints (list (list door-x door-center-y))
     set door-side ifelse-value (xcor < door-x) [-1] [1]
+    ; initialize-pedestrian aimed at the goal; re-aim at the door waypoint.
     update-desired-direction
     set heading atan ex ey
   ]
@@ -110,18 +137,24 @@ end
 
 ; Record every passage through the door plane in within-step time order.
 ; Snapshots include pedestrians removed at exits during the same step.
+; A path crosses the plane when its start and end lie on different sides;
+; the crossing time within the step is the fraction (door-x - start) / move.
 to track-door
   let crossings []
   foreach last-step-paths [path ->
     let start-x item 1 path
     let finish-x item 3 path
+    ; Exactly on the plane counts as the right side, so ending on the plane
+    ; and then moving on is counted once, not twice.
     let old-side ifelse-value (start-x < door-x) [-1] [1]
     let side ifelse-value (finish-x < door-x) [-1] [1]
     if old-side != side [
       let fraction (door-x - start-x) / (finish-x - start-x)
+      ; [crossing-time-fraction who new-side]
       set crossings lput (list fraction (item 0 path) side) crossings
     ]
   ]
+  ; Chronological order; who only breaks exact ties.
   set crossings sort-by [[a b] ->
     ifelse-value (item 0 a = item 0 b)
       [item 1 a < item 1 b] [item 0 a < item 0 b]] crossings
@@ -136,10 +169,12 @@ to track-door
   ]]
 end
 
+; Total number of door passages so far (both directions).
 to-report door-passes
   report length door-sequence
 end
 
+; Number of passages in one direction (+1 rightwards, -1 leftwards).
 to-report passes-in-direction [direction]
   report length filter [s -> s = direction] door-sequence
 end

@@ -77,8 +77,8 @@ JAVA_HOME=/opt/NetLogo-7.0.4/lib/runtime /opt/NetLogo-7.0.4/netlogo-headless.sh 
 
 To run all four experiments (`figure-3-lanes`, `door-width-sweep`,
 `light-cycle`, `crossing-flow-sweep`) with one command, use
-`run-experiments.sh` from the repository root (bash; on Windows use WSL or
-Git Bash):
+`run-experiments.sh` from the repository root. It runs in bash on Linux,
+macOS and Windows (Git Bash, MSYS2, Cygwin or WSL) with NetLogo 7 installed:
 
 ```bash
 ./run-experiments.sh                                   # all experiments
@@ -88,9 +88,18 @@ NETLOGO_HOME=/path/to/NetLogo ./run-experiments.sh     # other install location
 ```
 
 - Arguments: experiment names to run; with none, all run in the order above.
+  An unknown name is an error.
 - `THREADS`: parallel BehaviorSpace runs (default: number of CPU cores).
-- `NETLOGO_HOME`: NetLogo install directory (default `/opt/NetLogo-7.0.4`).
-- `JAVA_HOME`: Java runtime (default `$NETLOGO_HOME/lib/runtime`).
+- `NETLOGO_HOME`: NetLogo install directory. By default the script looks in
+  the usual places (`/opt`, `/usr/local`, `~` on Linux; `/Applications` on
+  macOS; `C:\Program Files` on Windows) and prefers NetLogo 7.0.4.
+- `NETLOGO_JAVA`: java executable. By default this is the Java bundled with
+  NetLogo, then `$JAVA_HOME/bin/java`, then `java` on the `PATH`. The bundled
+  Java comes first so an older system Java (8 or 11) is never picked up.
+
+The script starts NetLogo's headless runner directly with Java, so it does
+not need NetLogo's `netlogo-headless.sh` (Windows has no such script). On
+Windows it converts paths for `java.exe` automatically.
 
 Each experiment's table output is written to `work/<experiment>.csv`,
 overwriting any earlier result.

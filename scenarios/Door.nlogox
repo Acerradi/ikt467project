@@ -5,9 +5,9 @@
 ; =============================================================================
 ; Door scenario: a corridor divided by a wall with one door opening.
 ; Pedestrians start on one or both sides and must pass the door to reach the
-; far end. Shared model: ../core/pedestrians.nls (forces, integration, walls).
+; far end. Shared model: ../core/pedestrians.nls (AVM integration and scenario boundaries).
 ; Interface variables: dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
+; simulation-seed, show-trails?,
 ; run-checks?, log-csv?, door-width, room-width, initial-per-side,
 ; spawn-rate, two-sided?.
 ;
@@ -20,7 +20,7 @@
 ; Observations: the order of passages (door-sequence) shows whether the two
 ; sides alternate or one side goes through in a block.
 
-__includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
+__includes [ "../core/pedestrians.nls" "../core/avm.nls" "../core/boundaries.nls" "../core/checks.nls" "../core/stats.nls" ]
 
 globals [
   door-x door-center-y    ; door plane and the middle of the opening
@@ -28,7 +28,7 @@ globals [
   emptied-seconds         ; time the corridor first became empty, or false
 ]
 
-turtles-own [ door-side ]  ; -1 left of the door plane, +1 right of it
+turtles-own [ door-side door-target-y ]  ; -1 left of the door plane, +1 right of it
 
 ; Build the corridor and door, then place the initial crowd(s).
 to setup
@@ -71,10 +71,12 @@ end
 
 ; One integration step: arrivals, motion, door bookkeeping, checks, logging.
 to go
+  checks-begin-step
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
   ; Poisson arrivals with mean spawn-rate per simulated second.
   repeat random-poisson (spawn-rate * dt) [spawn-at-entrance]
+  foreach sort pedestrians [p -> ask p [update-door-route]]
   ped-step
   track-door
   if run-checks? [checks-update]
@@ -126,13 +128,35 @@ to add-pedestrian [x y direction]
   create-pedestrians 1 [
     initialize-pedestrian x y (ifelse-value (direction = 1) [open-right] [open-left])
       target-y direction
-    set waypoints (list (list door-x door-center-y))
+    let usable max (list 0 (door-width / 2 - body-radius - avm-wall-buffer))
+    set door-target-y door-center-y + usable * (ycor - door-center-y) /
+      (room-width / 2 - 0.75)
+    update-door-route
     set door-side ifelse-value (xcor < door-x) [-1] [1]
     ; initialize-pedestrian aimed at the goal; re-aim at the door waypoint.
     update-desired-direction
+    set move-ex ex
+    set move-ey ey
     set heading atan ex ey
   ]
   set spawned-count spawned-count + 1
+end
+
+; The opening is a portal rather than a shared centre point. Preserve the
+; pedestrian's approach height where possible, clipped to the body-clear span.
+; A target beyond the wall retains forward progress until the body is across.
+; This changes only the scenario's desired route, not the AVM interactions.
+to update-door-route
+  ifelse (xcor - door-x) * travel-direction >= body-radius [
+    set waypoints []
+  ] [
+    let clearance body-radius + avm-wall-buffer
+    let usable max (list 0 (door-width / 2 - clearance))
+    let portal-y max (list (door-center-y - usable)
+      min (list (door-center-y + usable) door-target-y))
+    let target-x door-x + travel-direction * (body-radius + waypoint-radius)
+    set waypoints (list (list target-x portal-y))
+  ]
 end
 
 ; Record every passage through the door plane in within-step time order.
@@ -141,7 +165,10 @@ end
 ; the crossing time within the step is the fraction (door-x - start) / move.
 to track-door
   let crossings []
-  foreach last-step-paths [path ->
+  foreach last-internal-step-paths [entry ->
+    let segment-start item 0 entry
+    let segment-duration item 1 entry
+    foreach item 2 entry [path ->
     let start-x item 1 path
     let finish-x item 3 path
     ; Exactly on the plane counts as the right side, so ending on the plane
@@ -150,8 +177,10 @@ to track-door
     let side ifelse-value (finish-x < door-x) [-1] [1]
     if old-side != side [
       let fraction (door-x - start-x) / (finish-x - start-x)
-      ; [crossing-time-fraction who new-side]
-      set crossings lput (list fraction (item 0 path) side) crossings
+      ; Absolute time preserves ordering across accepted internal steps.
+      let crossing-time segment-start + fraction * segment-duration
+      set crossings lput (list crossing-time (item 0 path) side) crossings
+    ]
     ]
   ]
   ; Chronological order; who only breaks exact ties.
@@ -164,8 +193,7 @@ to track-door
     set door-side side
     ; Not through yet (or pushed back): keep steering for the opening, so
     ; nobody walks straight at the wall beside it.
-    if side != travel-direction and empty? waypoints
-      [set waypoints (list (list door-x door-center-y))]
+    update-door-route
   ]]
 end
 
@@ -204,11 +232,11 @@ end
     <button x="90" y="10" width="75" height="40" display="go" kind="Observer" forever="true" disableUntilTicks="true">go</button>
     <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
     <slider x="10" y="60" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
-    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
-    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
-    <slider x="10" y="225" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0" direction="Horizontal" units="m/s^2" />
+    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.01" default="1.55" direction="Horizontal" units="m/s" />
+    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.18" direction="Horizontal" units="m/s" />
+    <monitor x="10" y="225" width="235" height="50" display="body radius (m)" precision="2" fontSize="11">body-radius</monitor>
     <slider x="10" y="280" width="235" height="50" display="simulation-seed" variable="simulation-seed" min="0" max="1000" step="1" default="42" direction="Horizontal" units="setup" />
-    <switch x="10" y="335" width="235" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
+    <monitor x="10" y="335" width="235" height="40" display="anticipation (s)" precision="2" fontSize="11">anticipation-time</monitor>
     <switch x="10" y="380" width="235" height="40" on="true" variable="run-checks?" display="run-checks?" />
     <switch x="10" y="425" width="235" height="40" on="false" variable="show-trails?" display="show-trails?" />
     <switch x="10" y="470" width="235" height="40" on="false" variable="log-csv?" display="log-csv?" />
@@ -261,67 +289,104 @@ end
         <update>if stats-sample? [plotxy elapsed-seconds door-passes / 10]</update>
       </pen>
     </plot>
+    <monitor x="275" y="795" width="190" height="55" display="integration segments" precision="0" fontSize="11">length last-internal-step-paths</monitor>
+    <monitor x="475" y="795" width="190" height="55" display="shortest segment (s)" precision="8" fontSize="11">ifelse-value (empty? last-internal-step-paths) [0] [min map [entry -&gt; item 1 entry] last-internal-step-paths]</monitor>
+    <monitor x="275" y="865" width="190" height="55" display="repulsion k" precision="3" fontSize="11">avm-strength</monitor>
+    <monitor x="475" y="865" width="190" height="55" display="range D (m)" precision="3" fontSize="11">avm-range</monitor>
+    <monitor x="675" y="865" width="190" height="55" display="time gap T (s)" precision="3" fontSize="11">avm-time-gap</monitor>
+    <monitor x="875" y="865" width="190" height="55" display="turning tau (s)" precision="3" fontSize="11">tau</monitor>
   </widgets>
-  <info><![CDATA[## WHAT IS IT?
+  <info><![CDATA[## DOOR
 
-A 20 m corridor (`room-width` wide) is divided at x = 10 m by a wall with one
-door opening of `door-width`. `initial-per-side` pedestrians start on the left
-(walking right, orange) and, with `two-sided?`, as many on the right (walking
-left, blue). `spawn-rate` adds arrivals at the ends. Everyone steers for the
-middle of the door (a waypoint) and then for a random point at the far end.
+A 20 m corridor is divided by a wall with one opening, 1.2 m wide by default. When two-sided? is on, 20 pedestrians initially stand on each side. Pedestrians steer to the middle of the opening, then to their far exit. Existing waypoint recovery and arrival rules remain; there is no yielding controller.
 
-## WHAT TO LOOK FOR
+## ANTICIPATION VELOCITY MODEL (AVM)
 
-Expected: pedestrians slow down or wait while someone is in the door; with a
-crowd on both sides, passages alternate between directions. `alternation` is
-the fraction of consecutive passages that change direction (1 = strict
-alternation). `waiting at door` counts people standing still within 3 m of it.
+This model uses Xu, Chraibi and Seyfried (2021), Eqs. (1)-(10).
+Pedestrians choose a direction using anticipated neighbour positions, then
+select speed from available headway along that direction:
 
-## DOOR WIDTH AND THE WALL FORCE
+    speed = min(free-speed, max(0, headway / time-gap))
 
-With the paper's wall force 50 exp(-d / 0.2) m/s^2, both door posts push back
-on someone walking through the middle of a narrow opening. For an opening of
-0.8 m the peak push-back is about 5.0 m/s^2, larger than the driving force
-v0 / tau = 2.68 m/s^2 of an average walker, so a lone pedestrian stops in
-front of it. The peak falls below 2.68 m/s^2 at about 1.0 m (2.79 at 1.0 m,
-2.09 at 1.1 m).
+There is no social-force acceleration sum and no stored preferred-velocity
+accumulator. The old 1.3-times-desired-speed cap does not apply: the individual
+free speed itself is the maximum. Each pedestrian samples free speed once,
+using mean 1.55 m/s and standard deviation 0.18 m/s by default. Nonpositive
+Gaussian draws are resampled, as in the project initialization.
 
-Historical results before the hard pair constraint, measured with
-`door-width-sweep` (20 per side, both directions, seeds 1-3,
-180 s limit): 0.8-0.9 m: blocked (0-1 passages); 1.0 m: 7-9 of 40 pass;
-1.1-1.2 m: 24-38 of 40 pass, the counterflow jams and the corridor never
-empties; 1.4 m: empties in 68-79 s with alternation about 0.7; 1.6 m:
-45-56 s. The default 1.2 m lets a lone walker through one at a time (centres
-must stay 0.2 m from each post). At every passable width the crowd pressing
-at the door squeezes people to 0.10-0.20 m apart, and a few pass-throughs
-occurred: the soft pair repulsion alone does not stop crowd pressure.
-The current 0.5 m constraint prevents these overlaps; these historical flow
-and alternation figures must be remeasured with the constraint enabled.
+The Table 3 bidirectional parameter set is used in every scenario:
+repulsion strength k = 6, interaction range D = 0.01 m, time-gap T = 0.6 s,
+turning time tau = 0.3 s, anticipation time = 0.75 s. Radius r = 0.20 m is
+the requested change from the paper's 0.18 m. Thus touching bodies have
+a centre distance of 0.4 m. Actual separation is measured, not enforced by
+a separate pair constraint. The same radius is used for drawing, pair
+headway, wall clearance, door posts and traffic-light stop placement.
 
-## SHARED MODEL
+There is no pedestrian-pair position projection, hidden overlap correction,
+or additional pair repulsion. Pair spacing follows the AVM equations and
+the fixed timestep; overlap diagnostics remain observational.
+The paper chooses a random side for an exactly aligned predicted neighbour;
+this is distinct from the former continuous random-force control.
 
-Forces, integration and walls come from `../core/pedestrians.nls`; correctness
-checks from `../core/checks.nls`; statistics, plots and CSV logging from
-`../core/stats.nls`. Every wall segment exerts the paper's wall force and is
-impenetrable (centres stay `body-radius` = 0.2 m away). `../core/contact.nls`
-adds a joint hard 0.5 m centre-to-centre constraint along the whole step.
-This supplements the unchanged social forces and may produce queues or jams.
+## WALLS AND SCENARIO BOUNDARIES
 
-## CORRECTNESS CHECKS
+The preprint does not specify a wall law. This implementation adds documented
+wall gliding inspired by the authors' JuPedSim implementation: within radius
+plus a 0.1 m buffer, an inward heading component is removed and a 0.3 outward
+component is added before normalization. Wall steering runs BEFORE the final
+pedestrian headway speed calculation so its direction is consistent with it.
+This ordering is our integration choice, not an exact JuPedSim reproduction.
 
-With `run-checks?` on, every step updates: `pass-throughs` (deep swept closest
-approaches below 0.2 m in any direction), `min separation seen`, wall clearance
-and speed-cap violations (|v| > 1.3 v0). `overlapping pairs` counts drawn
-circles overlapping now. With the default pair constraint enabled, minimum
-separation stays at least 0.5 m within numerical tolerance and both counts
-remain zero. `contact-solver-fallbacks` counts safe stops if the solver stalls.
+Wall segments and their round end caps use the pedestrian radius. A swept
+geometric bound can only reduce speed along the selected heading; it does
+not redirect velocity after pair-speed selection or reposition a pedestrian.
+A red stop line uses gap/T and a swept advance bound. No reverse speed or
+random creeping is added. Existing geometry, spawning, destinations and
+routing are scenario choices, not claims of reproducing the paper's entire
+experiment. The crossing remains uncontrolled.
 
-## LOGGING
+## NUMERICS AND CHECKS
 
-With `log-csv?` on, setup writes `../work/<scenario>.csv` (create the `work`
-folder first): every 0.1 s, the mean, standard deviation and sample variance
-of speed, speed / desired speed, forward speed, sideways speed and completed
-travel times.
+Click setup, then go; click go again to pause. Step advances one interval of
+length dt. Heading uses normalized forward Euler, and every pedestrian uses
+the same old-state snapshot before all new states are committed. The physical
+time-gap, anticipation time and turning time are separate parameters.
+
+There is no added pedestrian-distance limit: no pair position projection,
+overlap-based rejection, automatic timestep halving, distance-dependent step
+cap or minimum-separation abort. A step is committed even if it produces
+overlapping bodies. The experiment measures whether AVM's own direction and
+speed equations maintain separation at the chosen dt. The body diameter of
+0.4 m remains in the paper's headway formula; it is not an extra acceptance
+condition. Smaller fixed timesteps can be compared to measure discretization
+sensitivity without imposing a distance threshold.
+
+The traffic-light scenario alone can split an outer interval at its scheduled
+light event. Recorded paths include every resulting segment, periodic seams
+and pedestrians removed at exits. Door passages are collected chronologically.
+
+With run-checks? on, separation and overlap diagnostics only observe the
+generated motion; they never change it or stop a run because people overlap.
+check-invariants still validates finite states, wall clearance and the
+individual free-speed bound. The existing wall and red-stop boundary rules
+remain scenario additions, separate from the pedestrian-pair equations.
+
+Previous results from the version that rejected overlapping steps do not
+establish collision avoidance by AVM alone. See AVM.md for the current
+unconstrained-pair test protocol and results. Scenario plots and CSV logging
+retain their existing sampling cadence.
+
+## SOURCES
+
+Xu, Chraibi and Seyfried (2021), Anticipation in a velocity-based model for
+pedestrian dynamics, especially Eqs. (1)-(10) and Table 3:
+https://arxiv.org/pdf/2107.00624
+
+Author project explanation distinguishing JuPedSim wall handling:
+https://pedestriandynamics.org/models/anticipation_velocity_model/
+
+The JuPedSim implementation also contains a pair buffer and random creep;
+those additions are not adopted in this paper-based implementation.
 ]]></info>
   <turtleShapes>
     <shape name="default" rotatable="false" editableColorIndex="0">
@@ -353,12 +418,6 @@ travel times.
         <metric>wall-penetration-count</metric>
       </metrics>
       <constants>
-        <enumeratedValueSet variable="relative-anticipation?">
-            <value value="true"></value>
-          </enumeratedValueSet>
-        <enumeratedValueSet variable="noise-strength">
-            <value value="0"></value>
-          </enumeratedValueSet>
         <enumeratedValueSet variable="dt">
             <value value="0.02"></value>
           </enumeratedValueSet>
@@ -372,10 +431,10 @@ travel times.
             <value value="false"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="mean-desired-speed">
-            <value value="1.34"></value>
+            <value value="1.55"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="desired-speed-sd">
-            <value value="0.26"></value>
+            <value value="0.18"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="initial-per-side">
             <value value="20"></value>

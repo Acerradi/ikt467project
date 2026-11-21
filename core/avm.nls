@@ -1,0 +1,150 @@
+; =============================================================================
+; Xu, Chraibi and Seyfried (2021), anticipation velocity model, Eqs. (1)--(10).
+; Pure snapshot reporters: no turtle, observer, lifecycle or RNG state is changed.
+;
+; A row is [who x y vx vy move-ex move-ey ex ey desired-speed].
+; move-e is the retained unit movement heading, including when speed is zero;
+; e is the unit desired direction. Both velocities and headings in all rows are
+; from the same old state. The caller supplies rows in ascending who order.
+; Only the speed calculation uses the newly relaxed movement heading.
+;
+; Paper Eq. (6) reverses the indices in its sum. We consistently use the
+; influence OF j ON i from Eqs. (3)--(5), as in the authors' implementation.
+; Eq. (7) uses normalized forward Euler, also following their implementation.
+; We do not import its cutoff, extra gap buffer, random creep or reversal snap.
+; Periodic minimum images and wall/stop rules are supplied by the project.
+; No pairwise position projection or extra pair-gap buffer is used.
+; =============================================================================
+
+to-report avm-relative-position [own-row other-row]
+  let qx (item 1 other-row) - (item 1 own-row)
+  if active-periodic? [set qx periodic-delta-x qx]
+  report (list qx ((item 2 other-row) - (item 2 own-row)))
+end
+
+; Eq. (1): the union of the forward movement and desired-direction half-planes.
+; Strict > is the paper's boundary convention; an exactly side-on neighbor is
+; omitted unless it lies in front of the other direction.
+to-report avm-visible? [own-row qx qy]
+  report (((item 5 own-row) * qx + (item 6 own-row) * qy > 0) or
+          ((item 7 own-row) * qx + (item 8 own-row) * qy > 0))
+end
+
+; Eq. (5) projects FUTURE j minus CURRENT i onto i's desired perpendicular.
+; This differs intentionally from the relative prediction in Eq. (2).
+to-report avm-side-alignment [own-row other-row qx qy]
+  let predicted-x qx + anticipation-time * (item 3 other-row)
+  let predicted-y qy + anticipation-time * (item 4 other-row)
+  report predicted-x * (- item 8 own-row) + predicted-y * (item 7 own-row)
+end
+
+; The calling integration pass assigns each requested tie a random +/-1 in
+; canonical [own-who, other-who] order before calculating any new states.
+; |alignment| <= 1e-12 metres is a numerical representation of exact alignment,
+; not an additional random force or a distance-dependent avoidance threshold.
+to-report avm-tie-neighbors [own-row states]
+  let result []
+  foreach states [other-row ->
+    if (item 0 other-row) != (item 0 own-row) [
+      let q avm-relative-position own-row other-row
+      let qx item 0 q
+      let qy item 1 q
+      if avm-visible? own-row qx qy [
+        if abs (avm-side-alignment own-row other-row qx qy) <= 1e-12 [
+          set result lput (item 0 other-row) result
+        ]
+      ]
+    ]
+  ]
+  report result
+end
+
+; Eqs. (2)--(5), returning j's vector contribution to i's desired direction.
+; tie-sign is the selected coefficient of the desired perpendicular when
+; aligned. It must be +/-1 for a tie; it is ignored for every other pair.
+to-report avm-influence [own-row other-row tie-sign]
+  if (item 0 own-row) = (item 0 other-row) [report (list 0 0)]
+  let q avm-relative-position own-row other-row
+  let qx item 0 q
+  let qy item 1 q
+  let distance-now vector-length qx qy
+  if distance-now = 0 [error "AVM cannot evaluate two pedestrian centres at the same position."]
+  if not avm-visible? own-row qx qy [report (list 0 0)]
+  let ux qx / distance-now
+  let uy qy / distance-now
+  ; s^a - 2r = max(0, |q| - 2r + t_a (v_j-v_i) dot q/|q|).
+  let relative-x (item 3 other-row) - (item 3 own-row)
+  let relative-y (item 4 other-row) - (item 4 own-row)
+  let predicted-gap max (list 0
+    (distance-now - 2 * body-radius +
+      anticipation-time * (relative-x * ux + relative-y * uy)))
+  let alignment (item 7 own-row) * (item 5 other-row) +
+                (item 8 own-row) * (item 6 other-row)
+  let strength avm-strength * (1 + (1 - alignment) / 2) *
+               exp (- predicted-gap / avm-range)
+  let side avm-side-alignment own-row other-row qx qy
+  let chosen-sign 0
+  ifelse abs side <= 1e-12 [
+    if tie-sign != -1 and tie-sign != 1 [
+      error "AVM needs a preassigned +/-1 side choice for an aligned visible pair."
+    ]
+    set chosen-sign tie-sign
+  ] [
+    set chosen-sign ifelse-value (side > 0) [-1] [1]
+  ]
+  report (list (strength * chosen-sign * (- item 8 own-row))
+               (strength * chosen-sign * (item 7 own-row)))
+end
+
+; Eq. (6), followed by the normalized Euler interpretation of Eq. (7).
+; tie-signs is a list of [other-who +/-1] for this pedestrian only.
+to-report avm-steering [own-row states step-size tie-signs]
+  let desired-x item 7 own-row
+  let desired-y item 8 own-row
+  let old-x item 5 own-row
+  let old-y item 6 own-row
+  ; Arrival/lifecycle handling belongs to the caller. Retain the movement
+  ; heading if no goal direction exists exactly at the target.
+  if desired-x = 0 and desired-y = 0 [report (list old-x old-y)]
+  let sum-x desired-x
+  let sum-y desired-y
+  foreach states [other-row ->
+    if (item 0 other-row) != (item 0 own-row) [
+      let chosen-sign 0
+      let choices filter [entry -> (item 0 entry) = (item 0 other-row)] tie-signs
+      if not empty? choices [set chosen-sign item 1 first choices]
+      let contribution avm-influence own-row other-row chosen-sign
+      set sum-x sum-x + item 0 contribution
+      set sum-y sum-y + item 1 contribution
+    ]
+  ]
+  let sum-length vector-length sum-x sum-y
+  if sum-length = 0 [error "AVM desired direction is undefined."]
+  let optimal-x sum-x / sum-length
+  let optimal-y sum-y / sum-length
+  let new-x old-x + step-size * (optimal-x - old-x) / tau
+  let new-y old-y + step-size * (optimal-y - old-y) / tau
+  let new-length vector-length new-x new-y
+  if new-length = 0 [error "AVM direction relaxation reached zero; reduce the integration step."]
+  report (list (new-x / new-length) (new-y / new-length))
+end
+
+; Eqs. (8)--(10). The blocker strip uses NEW heading and OLD positions.
+; The gap is radial centre distance minus diameter, not longitudinal distance
+; or the ray-intersection distance. No blockers means unrestricted free speed.
+to-report avm-speed [own-row states heading-x heading-y]
+  let result item 9 own-row
+  foreach states [other-row ->
+    if (item 0 other-row) != (item 0 own-row) [
+      let q avm-relative-position own-row other-row
+      let qx item 0 q
+      let qy item 1 q
+      if heading-x * qx + heading-y * qy >= 0 and
+         abs ((- heading-y) * qx + heading-x * qy) <= 2 * body-radius [
+        let gap (vector-length qx qy) - 2 * body-radius
+        set result min (list result (max (list 0 (gap / avm-time-gap))))
+      ]
+    ]
+  ]
+  report result
+end

@@ -1,0 +1,296 @@
+; AVM wall extensions: author-style direction gliding, then scalar boundary
+; speed limits along the chosen heading. These are not in the 2021 preprint.
+; No pedestrian pair is projected and no endpoint is repositioned here.
+; Gliding is applied BEFORE the AVM direction-dependent pedestrian speed law.
+
+; Geometry/perception extension used by the authors' JuPedSim implementation:
+; a solid wall hides a neighbour from both steering and headway calculation.
+; This is not a distance cutoff and does not modify the pair equations below.
+; Filtering preserves snapshot order and consumes no random numbers.
+to-report avm-unoccluded-neighbors [own-row states]
+  if empty? wall-segments [report states]
+  let px item 1 own-row
+  let py item 2 own-row
+  report filter [other-row ->
+    ifelse-value ((item 0 other-row) = (item 0 own-row)) [true] [
+      avm-clear-line? px py
+        (px + item 0 (avm-relative-position own-row other-row))
+        (item 2 other-row)
+    ]
+  ] states
+end
+
+; Visibility uses the literal wall geometry, without inflating a pedestrian
+; pair or imposing a minimum separation. Touching a post blocks the sight line.
+; The caller supplies an unwrapped endpoint for a periodic minimum image.
+to-report avm-clear-line? [from-x from-y to-x to-y]
+  foreach wall-segments [wall ->
+    ifelse active-periodic? [
+      let first-image floor (min (list from-x to-x) / hall-length) - 1
+      let last-image floor (max (list from-x to-x) / hall-length) + 1
+      foreach (range first-image (last-image + 1)) [image-index ->
+        let shift image-index * hall-length
+        if avm-line-meets-wall? from-x from-y to-x to-y
+          (list (item 0 wall + shift) (item 1 wall)
+                (item 2 wall + shift) (item 3 wall)) [report false]
+      ]
+    ] [
+      if avm-line-meets-wall? from-x from-y to-x to-y wall [report false]
+    ]
+  ]
+  report true
+end
+
+; Closed-segment intersection, including collinear overlap and endpoints.
+; Bounding boxes reject unrelated walls before the orientation calculation.
+to-report avm-line-meets-wall? [from-x from-y to-x to-y wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  ; Exact early rejection for the axis-aligned scenario walls. This is the
+  ; same bounding-box test below, without allocating min/max lists for the
+  ; common case where both endpoints are strictly on one side of the wall.
+  if y1 = y2 [
+    if (from-y > y1 and to-y > y1) or (from-y < y1 and to-y < y1) [report false]
+  ]
+  if x1 = x2 [
+    if (from-x > x1 and to-x > x1) or (from-x < x1 and to-x < x1) [report false]
+  ]
+  if max (list from-x to-x) < min (list x1 x2) or
+     min (list from-x to-x) > max (list x1 x2) or
+     max (list from-y to-y) < min (list y1 y2) or
+     min (list from-y to-y) > max (list y1 y2) [report false]
+  let line-x to-x - from-x
+  let line-y to-y - from-y
+  let wall-x x2 - x1
+  let wall-y y2 - y1
+  let side-a line-x * (y1 - from-y) - line-y * (x1 - from-x)
+  let side-b line-x * (y2 - from-y) - line-y * (x2 - from-x)
+  let side-c wall-x * (from-y - y1) - wall-y * (from-x - x1)
+  let side-d wall-x * (to-y - y1) - wall-y * (to-x - x1)
+  report ((side-a <= 0 and side-b >= 0) or (side-a >= 0 and side-b <= 0)) and
+         ((side-c <= 0 and side-d >= 0) or (side-c >= 0 and side-d <= 0))
+end
+
+; A nearby wall removes an inward heading component and adds a small outward
+; component, following JuPedSim's gliding rule (buffer .1m, pushout .3).
+; The returned unit heading is subsequently used for all pair-headway tests.
+to-report avm-wall-heading [px py hx hy]
+  let out-x hx
+  let out-y hy
+  foreach wall-segments [wall ->
+    let nearest avm-nearest-wall-point px py wall
+    let nx px - item 0 nearest
+    let ny py - item 1 nearest
+    let clearance vector-length nx ny
+    if clearance < body-radius - 1e-9
+      [error "AVM pedestrian starts inside a wall capsule."]
+    if clearance < body-radius + avm-wall-buffer and clearance > 0 [
+      set nx nx / clearance
+      set ny ny / clearance
+      let inward out-x * nx + out-y * ny
+      if inward < 0 [
+        set out-x out-x - inward * nx + 0.3 * nx
+        set out-y out-y - inward * ny + 0.3 * ny
+      ]
+    ]
+  ]
+  let magnitude vector-length out-x out-y
+  if magnitude = 0 [report (list 0 0)]
+  report (list (out-x / magnitude) (out-y / magnitude))
+end
+
+; The same stop-line law on either coordinate axis. stop-position is the
+; centre's permitted coordinate; the scenario accounts for body radius when
+; placing the gate. Already-admitted people have no stop position assigned.
+; This scenario rule changes admission, never projects pedestrian positions.
+to-report avm-axis-stop-speed [coordinate heading-component proposed-speed step-size stop-position direction]
+  if step-size <= 0 [error "AVM stop step must be positive."]
+  let speed max (list 0 proposed-speed)
+  let gap max (list 0 ((stop-position - coordinate) * direction))
+  set speed min (list speed (gap / avm-time-gap))
+  let approach-component heading-component * direction
+  if approach-component > 0 [set speed min (list speed (gap / (step-size * approach-component)))]
+  report speed
+end
+
+; Only reduce scalar speed. A red stop uses gap/T and an exact swept bound.
+; Finite walls are capsules of radius body-radius, including door posts.
+to-report avm-boundary-speed [px py hx hy proposed-speed step-size stop-position direction]
+  if step-size <= 0 [error "AVM boundary step must be positive."]
+  let speed max (list 0 proposed-speed)
+  if is-number? stop-position [
+    let gap max (list 0 ((stop-position - px) * direction))
+    set speed min (list speed (gap / avm-time-gap))
+    let approach-component hx * direction
+    if approach-component > 0 [set speed min (list speed (gap / (step-size * approach-component)))]
+  ]
+  if speed = 0 [report 0]
+  let end-x px + step-size * speed * hx
+  let end-y py + step-size * speed * hy
+  let fraction 1
+  foreach wall-segments [wall ->
+    let contact avm-swept-wall-contact px py end-x end-y wall
+    if contact != false [set fraction min (list fraction item 0 contact)]
+  ]
+  if fraction < 1 [
+    ; Roundoff-only clearance at contact; no added pedestrian safety radius.
+    let move-length step-size * speed * (vector-length hx hy)
+    if move-length > 0 [set fraction max (list 0 (fraction - 1e-10 / move-length))]
+    set speed speed * fraction
+  ]
+  report speed
+end
+
+; Periodic full-width walls are infinite horizontal lines (no seam posts).
+; For other periodic segments, use the nearest translated copy.
+to-report avm-nearest-wall-point [px py wall]
+  if not active-periodic? [report nearest-point-on-segment px py wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  if y1 = y2 and abs (x2 - x1) >= hall-length - epsilon [report (list px y1)]
+  let image-center floor (px / hall-length)
+  let best []
+  let best-distance 1e100
+  foreach (range (image-center - 1) (image-center + 2)) [index ->
+    let shift index * hall-length
+    let shifted (list (x1 + shift) y1 (x2 + shift) y2)
+    let nearest nearest-point-on-segment px py shifted
+    let separation vector-length (px - item 0 nearest) (py - item 1 nearest)
+    if separation < best-distance [set best nearest set best-distance separation]
+  ]
+  report best
+end
+
+; Swept point-versus-capsule geometry reused from the project's tested walls.
+; Reports first contact fraction and its supporting plane. Only the fraction
+; is used by AVM to limit speed; no supporting-plane position projection runs.
+to-report avm-swept-wall-contact [from-x from-y to-x to-y wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  ; Periodic hallway wall spanning the whole period: treat it as an infinite
+  ; horizontal line, so the seam never creates a false end post.
+  if active-periodic? and y1 = y2 and abs (x2 - x1) >= hall-length - epsilon [
+    let side ifelse-value (from-y >= y1) [1] [-1]   ; +1 above the wall, -1 below
+    let limit side * y1 + body-radius
+    if side * to-y >= limit - 1e-10 [report false]  ; endpoint still clear
+    let fraction 0
+    if side * from-y > limit [set fraction (limit - side * from-y) / (side * (to-y - from-y))]
+    report (list fraction 0 side limit)
+  ]
+  if not active-periodic? [report avm-swept-capsule-contact from-x from-y to-x to-y wall]
+  ; Other walls on a periodic walkway: test every periodic copy of the wall
+  ; that the (unwrapped) path could reach, and keep the earliest contact.
+  let best false
+  let first-image (floor (min (list from-x to-x) / hall-length)) - 1
+  let last-image (floor (max (list from-x to-x) / hall-length)) + 1
+  foreach (range first-image (last-image + 1)) [k ->
+    let shift k * hall-length
+    let shifted-wall (list (x1 + shift) y1 (x2 + shift) y2)
+    let candidate avm-swept-capsule-contact from-x from-y to-x to-y shifted-wall
+    if candidate != false [
+      ifelse best = false [set best candidate]
+        [if item 0 candidate < item 0 best [set best candidate]]
+    ]
+  ]
+  report best
+end
+
+
+to-report avm-swept-capsule-contact [from-x from-y to-x to-y wall]
+  let x1 item 0 wall
+  let y1 item 1 wall
+  let x2 item 2 wall
+  let y2 item 3 wall
+  let move-x to-x - from-x
+  let move-y to-y - from-y
+  let seg-x x2 - x1
+  let seg-y y2 - y1
+  let length-squared seg-x * seg-x + seg-y * seg-y
+  ; Already inside the capsule at the start (should not happen in a valid
+  ; state): report an immediate contact pushing straight outwards.
+  let nearest nearest-point-on-segment from-x from-y wall
+  let start-nx from-x - item 0 nearest
+  let start-ny from-y - item 1 nearest
+  let start-distance vector-length start-nx start-ny
+  if start-distance < body-radius - 1e-10 [
+    if start-distance < epsilon [error "Pedestrian starts on a wall. Review initial placement."]
+    set start-nx start-nx / start-distance
+    set start-ny start-ny / start-distance
+    report (list 0 start-nx start-ny (start-nx * item 0 nearest + start-ny * item 1 nearest + body-radius))
+  ]
+  let best false
+  ; Flat faces (skipped for zero-length segments, which are pure posts).
+  if length-squared > 0 [
+    let seg-length sqrt length-squared
+    ; Unit normal of the segment; each side is tried with its own sign.
+    let nx (- seg-y) / seg-length
+    let ny seg-x / seg-length
+    foreach [-1 1] [side ->
+      let normal-x side * nx
+      let normal-y side * ny
+      ; The face lies body-radius out from the segment along this normal.
+      let limit normal-x * x1 + normal-y * y1 + body-radius
+      let before normal-x * from-x + normal-y * from-y
+      let change normal-x * move-x + normal-y * move-y
+      ; Must start outside this face and move towards it.
+      if before >= limit - 1e-10 and change < -1e-12 [
+        let fraction (limit - before) / change
+        if fraction >= -1e-10 and fraction < 1 - 1e-10 [
+          set fraction max (list 0 fraction)
+          let hit-x from-x + fraction * move-x
+          let hit-y from-y + fraction * move-y
+          ; Only count it if the hit is alongside the segment (not beyond
+          ; its ends; those are handled by the round caps).
+          let along ((hit-x - x1) * seg-x + (hit-y - y1) * seg-y) / length-squared
+          if along >= 0 and along <= 1 [
+            let candidate (list fraction normal-x normal-y limit)
+            ifelse best = false [set best candidate]
+              [if fraction < item 0 best [set best candidate]]
+          ]
+        ]
+      ]
+    ]
+  ]
+  ; Round end caps (door posts and wall corners).
+  foreach (list (list x1 y1) (list x2 y2)) [point ->
+    let candidate avm-swept-circle-contact from-x from-y to-x to-y item 0 point item 1 point
+    if candidate != false [
+      ifelse best = false [set best candidate]
+        [if item 0 candidate < item 0 best [set best candidate]]
+    ]
+  ]
+  report best
+end
+
+
+to-report avm-swept-circle-contact [from-x from-y to-x to-y px py]
+  let move-x to-x - from-x
+  let move-y to-y - from-y
+  let quadratic move-x * move-x + move-y * move-y
+  if quadratic = 0 [report false]
+  let qx from-x - px
+  let qy from-y - py
+  let half-linear qx * move-x + qy * move-y
+  let constant qx * qx + qy * qy - body-radius * body-radius
+  let discriminant half-linear * half-linear - quadratic * constant
+  if discriminant <= 0 [report false]        ; the path misses the circle
+  let fraction (- half-linear - sqrt discriminant) / quadratic
+  if fraction < -1e-10 or fraction >= 1 - 1e-10 [report false]
+  set fraction max (list 0 fraction)
+  let nx qx + fraction * move-x
+  let ny qy + fraction * move-y
+  let norm vector-length nx ny
+  if norm = 0 [report false]
+  set nx nx / norm
+  set ny ny / norm
+  ; Moving away from (or tangentially past) the post is not a contact.
+  if nx * move-x + ny * move-y >= -1e-12 [report false]
+  report (list fraction nx ny (nx * px + ny * py + body-radius))
+end
+

@@ -4,8 +4,9 @@
 ; Correctness checks shared by all scenarios. Requires core/pedestrians.nls.
 ;
 ; Reporters are usable as monitors, BehaviorSpace metrics and from the Java
-; tests. Call checks-reset in setup and checks-update after every ped-step to
-; accumulate step-by-step events (pass-throughs, worst values seen).
+; tests. Call checks-reset in setup, checks-begin-step once per outer go,
+; and checks-update after ped-step. Every accepted internal path is consumed
+; once, including when a traffic-light event splits the outer interval.
 ;
 ; None of these procedures use random numbers or change pedestrians, so
 ; turning run-checks? on or off never changes a simulation run.
@@ -20,7 +21,8 @@ globals [
   pass-through-events      ; pairs with a deep closest approach during a step
   worst-min-separation     ; smallest centre separation seen so far (m)
   worst-wall-clearance     ; smallest centre-to-wall distance seen so far (m)
-  speed-cap-violations     ; pedestrian-steps with |v| > 1.3 v0
+  speed-cap-violations     ; observed endpoint steps with speed above AVM free speed
+  checks-segments-processed ; cursor into last-internal-step-paths
   lane-max-distance        ; 1.5 m: lane-membership distance from the project text
   lane-gap                 ; a y-gap larger than this starts a new candidate lane
   lane-min-members         ; smaller groups are not counted as lanes
@@ -34,6 +36,7 @@ to checks-reset
   set worst-min-separation 1e9
   set worst-wall-clearance 1e9
   set speed-cap-violations 0
+  set checks-segments-processed 0
   set lane-max-distance 1.5
   set lane-gap 0.6
   set lane-min-members 5
@@ -41,14 +44,34 @@ end
 
 ; ---------------------------------------------------------------- per step
 
-; Call once after every ped-step.
-; Separation uses both the end-of-step snapshot and the swept paths, so a
-; close approach in the middle of a step is not missed.
+; Clear accepted-substep history once per outer go, not once per ped-step:
+; TrafficLight can call ped-step twice on opposite sides of a light event.
+to checks-begin-step
+  set last-internal-step-paths []
+  set last-step-paths []
+  set checks-segments-processed 0
+end
+
+; Consume only newly accepted substeps. Repeated calls cannot double-count
+; earlier segments in the same outer interval.
 to checks-update
-  set pass-through-events pass-through-events + pass-through-pairs
-  set worst-min-separation min (list worst-min-separation min-pair-separation swept-min-pair-separation)
+  let new-segments? length last-internal-step-paths > checks-segments-processed
+  foreach sublist last-internal-step-paths checks-segments-processed
+    length last-internal-step-paths [entry ->
+    let swept swept-pair-summary-for item 2 entry
+    set pass-through-events pass-through-events + item 1 swept
+    set worst-min-separation min (list worst-min-separation item 0 swept)
+    foreach item 3 entry [state ->
+      foreach wall-segments [wall ->
+        set worst-wall-clearance min (list worst-wall-clearance
+          (distance-to-segment (item 1 state) (item 2 state) wall))
+      ]
+    ]
+  ]
+  set checks-segments-processed length last-internal-step-paths
+  set worst-min-separation min (list worst-min-separation min-pair-separation)
   set worst-wall-clearance min (list worst-wall-clearance min-wall-clearance)
-  set speed-cap-violations speed-cap-violations + speed-cap-violation-count
+  if new-segments? [set speed-cap-violations speed-cap-violations + speed-cap-violation-count]
 end
 
 ; Deep passes during the last step, independent of walking direction. The
@@ -58,28 +81,43 @@ end
 ; Core snapshots actual start/end coordinates before commits/deaths, including
 ; unwrapped end-x at periodic seams. Velocity cannot reconstruct wall contacts.
 to-report pass-through-pairs
-  let events 0
-  foreach last-step-paths [a ->
-    foreach last-step-paths [b ->
-      ; item 0 is who; a < b visits each unordered pair once.
-      if item 0 a < item 0 b and item 1 (swept-pair-info a b)
-        [set events events + 1]
-    ]
-  ]
-  report events
+  report item 1 swept-pair-summary
 end
 
 ; Smallest separation anywhere along the recorded linear motion paths.
 ; Includes pedestrians that arrived and were removed at the end of the step.
 to-report swept-min-pair-separation
+  report item 0 swept-pair-summary
+end
+
+; [minimum distance, deep passes]. The same ordered pairs and unchanged
+; swept-pair-info arithmetic are used for both quantities. No distance
+; cutoff, sampling or cached state between calls is involved.
+to-report swept-pair-summary
+  if empty? last-internal-step-paths [report swept-pair-summary-for last-step-paths]
+  let summaries map [entry -> swept-pair-summary-for item 2 entry] last-internal-step-paths
+  report (list (min map [summary -> item 0 summary] summaries)
+               (sum map [summary -> item 1 summary] summaries))
+end
+
+; One accepted integration segment; never flatten multiple substeps into a
+; single list, which would compare pedestrians from different times.
+to-report swept-pair-summary-for [paths]
   let closest 1e9
-  foreach last-step-paths [a ->
-    foreach last-step-paths [b ->
-      if item 0 a < item 0 b
-        [set closest min (list closest item 0 (swept-pair-info a b))]
+  let events 0
+  let remaining sort-by [[a b] -> item 0 a < item 0 b] paths
+  while [not empty? remaining] [
+    let a first remaining
+    set remaining but-first remaining
+    foreach remaining [b ->
+      if item 0 a < item 0 b [
+        let info swept-pair-info a b
+        set closest min (list closest item 0 info)
+        if item 1 info [set events events + 1]
+      ]
     ]
   ]
-  report closest
+  report (list closest events)
 end
 
 ; Path rows are [who start-x start-y end-x end-y]. Reports [distance deep-pass?].
@@ -130,13 +168,16 @@ end
 to-report min-pair-separation
   if count pedestrians < 2 [report 1e9]
   let closest 1e9
-  let people sort pedestrians
-  foreach people [a ->
-    foreach people [b ->
-      if [who] of a < [who] of b [
-        let distance-between [separation-from [xcor] of b [ycor] of b] of a
-        set closest min (list closest distance-between)
-      ]
+  ; Snapshot coordinates once, in the same who order as the original loop.
+  let remaining map [p -> [(list xcor ycor)] of p] sort pedestrians
+  while [not empty? remaining] [
+    let a first remaining
+    set remaining but-first remaining
+    foreach remaining [b ->
+      let delta-x item 0 a - item 0 b
+      if active-periodic? [set delta-x periodic-delta-x delta-x]
+      let distance-between vector-length delta-x (item 1 a - item 1 b)
+      set closest min (list closest distance-between)
     ]
   ]
   report closest
@@ -145,11 +186,14 @@ end
 ; Pairs whose drawn circles (diameter 2 body-radius) overlap now.
 to-report overlap-pair-count
   let overlaps 0
-  let people sort pedestrians
-  foreach people [a ->
-    foreach people [b ->
-      if [who] of a < [who] of b and
-        [separation-from [xcor] of b [ycor] of b] of a < 2 * body-radius
+  let remaining map [p -> [(list xcor ycor)] of p] sort pedestrians
+  while [not empty? remaining] [
+    let a first remaining
+    set remaining but-first remaining
+    foreach remaining [b ->
+      let delta-x item 0 a - item 0 b
+      if active-periodic? [set delta-x periodic-delta-x delta-x]
+      if vector-length delta-x (item 1 a - item 1 b) < 2 * body-radius
         [set overlaps overlaps + 1]
     ]
   ]
@@ -170,6 +214,9 @@ end
 
 ; Distance from point (px, py) to the closest point of a wall segment.
 to-report distance-to-segment [px py wall]
+  if active-periodic? and item 1 wall = item 3 wall and
+    abs (item 2 wall - item 0 wall) >= hall-length - epsilon
+    [report abs (py - item 1 wall)]
   let nearest nearest-point-on-segment px py wall
   report vector-length (px - item 0 nearest) (py - item 1 nearest)
 end
@@ -179,26 +226,67 @@ to-report wall-penetration-count
   report length filter [p -> [wall-clearance] of p < body-radius - check-tolerance] sort pedestrians
 end
 
-; The paper's individual cap |v| <= 1.3 v0 (desired speed may be exceeded by
-; up to 30 %, never more).
+; AVM Eq. (10) selects a nonnegative speed no greater than individual free
+; speed. This replaces the previous model's 1.3-times-desired-speed limit.
 to-report speed-cap-violation-count
-  report length filter [p -> [vector-length vx vy > 1.3 * desired-speed + check-tolerance] of p] sort pedestrians
+  report length filter [p -> [vector-length vx vy > desired-speed + check-tolerance] of p] sort pedestrians
 end
 
 ; Pedestrians walking faster than their own desired speed right now.
-; (Allowed by the model, up to the 1.3 cap; this is an observation, not an error.)
+; In AVM this also indicates a speed-law violation beyond numerical slack.
 to-report above-desired-speed-count
   report length filter [p -> [vector-length vx vy > desired-speed + check-tolerance] of p] sort pedestrians
 end
 
 ; Stop with an error if a hard invariant is broken. Use in tests/experiments.
 to check-invariants
+  foreach sort pedestrians [p ->
+    let state [(list who xcor ycor vx vy move-ex move-ey desired-speed)] of p
+    check-finite-state state
+    check-avm-state state
+    if item 1 state < min-pxcor - 0.5 or item 1 state >= max-pxcor + 0.5 or
+       item 2 state < min-pycor - 0.5 or item 2 state >= max-pycor + 0.5
+      [error (word "Pedestrian " item 0 state " left the world.")]
+  ]
+  foreach last-internal-step-paths [entry ->
+    foreach item 3 entry [state ->
+      check-finite-state state
+      check-avm-state state
+      foreach wall-segments [wall ->
+        if distance-to-segment (item 1 state) (item 2 state) wall < body-radius - check-tolerance
+          [error (word "Wall penetrated in accepted substep at t = " (item 0 entry + item 1 entry))]
+      ]
+    ]
+  ]
   if wall-penetration-count > 0 [error (word "Wall penetrated at t = " elapsed-seconds)]
-  if speed-cap-violation-count > 0 [error (word "Speed cap exceeded at t = " elapsed-seconds)]
-  ; The separation invariant only applies while the hard pair constraint is on.
-  if pair-contact-enabled? and
-    min (list min-pair-separation swept-min-pair-separation) < minimum-separation - check-tolerance
-    [error (word "Minimum pedestrian separation violated at t = " elapsed-seconds)]
+  if speed-cap-violation-count > 0 [error (word "AVM free speed exceeded at t = " elapsed-seconds)]
+  ; Body overlap is an experimental outcome, recorded by the separation and
+  ; overlap monitors. Never halt or repair motion merely because distance < 2r.
+  if pair-contact-enabled? [error "AVM requires pedestrian pair projection disabled."]
+end
+
+; Endpoint rows are [who x y vx vy move-ex move-ey desired-speed]. Recorded
+; paths/states are unwrapped and include departing pedestrians, so only live
+; committed states have world bounds checked. Legacy five-field synthetic
+; geometry fixtures can still be checked for finite coordinates and velocity.
+to check-finite-state [state]
+  foreach but-first state [value ->
+    if not is-number? value [error "A pedestrian state component is not numeric."]
+    if value != value or abs value > 1.7976931348623157E308
+      [error "A pedestrian state component is not finite."]
+  ]
+end
+
+; Check each accepted state, even when its pedestrian has already departed
+; or a later internal step has restored a valid speed/heading.
+to check-avm-state [state]
+  if length state >= 8 [
+    if item 7 state <= 0 [error "AVM free speed must be positive."]
+    if vector-length (item 3 state) (item 4 state) > item 7 state + check-tolerance
+      [error (word "AVM free speed exceeded in recorded state for pedestrian " item 0 state)]
+    if abs ((vector-length (item 5 state) (item 6 state)) - 1) > check-tolerance
+      [error (word "AVM movement heading is not unit length for pedestrian " item 0 state)]
+  ]
 end
 
 ; ---------------------------------------------------------------- lanes

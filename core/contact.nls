@@ -141,11 +141,19 @@ end
 ; Pairs that already have a cut are tested again; a satisfied pair yields
 ; no new cut, so the constraint count only grows for genuinely new contacts.
 to contact-add-pair-cuts [people]
-  foreach range length people [i ->
-    let a item i people
-    foreach (range (i + 1) (length people)) [j ->
-      let b item j people
-      let cut contact-pair-cut a b
+  ; Positions/displacements are constant throughout this discovery pass.
+  ; Read them once, retaining the caller's pair order and all pair tests.
+  let remaining map [p -> [(list self xcor ycor contact-dx contact-dy)] of p] people
+  while [not empty? remaining] [
+    let row-a first remaining
+    set remaining but-first remaining
+    let a item 0 row-a
+    foreach remaining [row-b ->
+      let b item 0 row-b
+      let qx item 1 row-a - item 1 row-b
+      if active-periodic? [set qx periodic-delta-x qx]
+      let cut contact-pair-cut-values a b qx (item 2 row-a - item 2 row-b)
+        (item 3 row-a - item 3 row-b) (item 4 row-a - item 4 row-b)
       if cut != false [
         set contact-constraints lput cut contact-constraints
         ask a [set contact-active? true]
@@ -173,13 +181,18 @@ to-report contact-pair-cut [a b]
   let qx [xcor] of a - [xcor] of b
   if active-periodic? [set qx periodic-delta-x qx]
   let qy [ycor] of a - [ycor] of b
+  report contact-pair-cut-values a b qx qy
+    ([contact-dx] of a - [contact-dx] of b) ([contact-dy] of a - [contact-dy] of b)
+end
+
+; Same scalar arithmetic for direct pair calls and cached discovery snapshots.
+; Initial validity is checked for every pair, even if its motion is safe.
+to-report contact-pair-cut-values [a b qx qy move-x move-y]
   let initial-distance vector-length qx qy
   if initial-distance < minimum-separation - 1e-9 [
     error (word "Pedestrians " [who] of a " and " [who] of b
       " start closer than minimum-separation. Run setup or use valid initial placement.")
   ]
-  let move-x [contact-dx] of a - [contact-dx] of b
-  let move-y [contact-dy] of a - [contact-dy] of b
   let movement-squared move-x * move-x + move-y * move-y
   if movement-squared = 0 [report false]    ; no relative motion: stays as is
   ; Quick reject: the relative move is too short to close the gap.
@@ -282,14 +295,17 @@ to-report contact-project-motions [people]
     set contact-disk-cy 0
   ]]
   set contact-constraints map [cut -> replace-item 5 cut 0] contact-constraints
+  ; Active membership cannot change inside this solve. Keep the original
+  ; caller order while avoiding three full-population scans every iteration.
+  let active-people filter [p -> [contact-active?] of p] people
   let iterations 0
   let converged? false
   while [not converged? and iterations < 2000] [
     ; Remember where this sweep started, to measure how much it moved.
-    foreach people [p -> if [contact-active?] of p [ask p [
+    foreach active-people [p -> ask p [
       set contact-iteration-dx contact-dx
       set contact-iteration-dy contact-dy
-    ]]]
+    ]]
     ; --- half-plane cuts (pairs, walls, stop lines) ---
     let index 0
     foreach contact-constraints [cut ->
@@ -325,7 +341,7 @@ to-report contact-project-motions [people]
       set index index + 1
     ]
     ; --- speed disks |d| <= 1.3 * desired-speed * dt (the individual cap) ---
-    foreach people [p -> if [contact-active?] of p [ask p [
+    foreach active-people [p -> ask p [
       ; Undo the previous disk correction, project radially onto the disk,
       ; and store the new correction.
       let dx-before contact-dx + contact-disk-cx
@@ -337,13 +353,13 @@ to-report contact-project-motions [people]
       set contact-dy factor * dy-before
       set contact-disk-cx dx-before - contact-dx
       set contact-disk-cy dy-before - contact-dy
-    ]]]
+    ]]
     ; Converged when a whole sweep barely moves anyone and no cut is violated.
     let largest-change 0
-    foreach people [p -> if [contact-active?] of p [
+    foreach active-people [p ->
       set largest-change max (list largest-change
         [vector-length (contact-dx - contact-iteration-dx) (contact-dy - contact-iteration-dy)] of p)
-    ]]
+    ]
     if largest-change <= 1e-11 and contact-largest-violation <= 1e-11 [set converged? true]
     set iterations iterations + 1
   ]

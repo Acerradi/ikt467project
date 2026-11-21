@@ -9,7 +9,7 @@
 ; the road when it turns red finish crossing.
 ; Shared model: ../core/pedestrians.nls (stop lines use its stop-x option).
 ; Interface variables: dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
+; simulation-seed, show-trails?,
 ; run-checks?, log-csv?, switch-time, start-green?, road-width,
 ; walkway-width, spawn-rate, initial-per-side.
 ;
@@ -21,7 +21,7 @@
 ; gives each pedestrian still before its curb a stop-x: the core then brakes
 ; it smoothly towards that line and never lets its centre cross it.
 
-__includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
+__includes [ "../core/pedestrians.nls" "../core/avm.nls" "../core/boundaries.nls" "../core/checks.nls" "../core/stats.nls" ]
 
 globals [
   road-left road-right    ; road edges (curbs), metres
@@ -72,6 +72,7 @@ end
 ; Advance the simulation by dt seconds. If the light changes inside this
 ; interval, the interval is split into substeps at the exact switch time.
 to go
+  checks-begin-step
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
   if switch-time <= 0 [error "switch-time must be positive."]
@@ -214,11 +215,11 @@ end
     <button x="90" y="10" width="75" height="40" display="go" kind="Observer" forever="true" disableUntilTicks="true">go</button>
     <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
     <slider x="10" y="60" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
-    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
-    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
-    <slider x="10" y="225" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0" direction="Horizontal" units="m/s^2" />
+    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.01" default="1.55" direction="Horizontal" units="m/s" />
+    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.18" direction="Horizontal" units="m/s" />
+    <monitor x="10" y="225" width="235" height="50" display="body radius (m)" precision="2" fontSize="11">body-radius</monitor>
     <slider x="10" y="280" width="235" height="50" display="simulation-seed" variable="simulation-seed" min="0" max="1000" step="1" default="42" direction="Horizontal" units="setup" />
-    <switch x="10" y="335" width="235" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
+    <monitor x="10" y="335" width="235" height="40" display="anticipation (s)" precision="2" fontSize="11">anticipation-time</monitor>
     <switch x="10" y="380" width="235" height="40" on="true" variable="run-checks?" display="run-checks?" />
     <switch x="10" y="425" width="235" height="40" on="false" variable="show-trails?" display="show-trails?" />
     <switch x="10" y="470" width="235" height="40" on="false" variable="log-csv?" display="log-csv?" />
@@ -288,64 +289,104 @@ end
         <update>if stats-sample? [plotxy elapsed-seconds ifelse-value light-green? [5] [0]]</update>
       </pen>
     </plot>
+    <monitor x="275" y="904" width="190" height="55" display="integration segments" precision="0" fontSize="11">length last-internal-step-paths</monitor>
+    <monitor x="475" y="904" width="190" height="55" display="shortest segment (s)" precision="8" fontSize="11">ifelse-value (empty? last-internal-step-paths) [0] [min map [entry -&gt; item 1 entry] last-internal-step-paths]</monitor>
+    <monitor x="275" y="974" width="190" height="55" display="repulsion k" precision="3" fontSize="11">avm-strength</monitor>
+    <monitor x="475" y="974" width="190" height="55" display="range D (m)" precision="3" fontSize="11">avm-range</monitor>
+    <monitor x="675" y="974" width="190" height="55" display="time gap T (s)" precision="3" fontSize="11">avm-time-gap</monitor>
+    <monitor x="875" y="974" width="190" height="55" display="turning tau (s)" precision="3" fontSize="11">tau</monitor>
   </widgets>
-  <info><![CDATA[## WHAT IS IT?
+  <info><![CDATA[## TRAFFICLIGHT
 
-A 40 m walkway is crossed in the middle by a road (`road-width`, darker
-grey) with a pedestrian light shown in the strips beside both curbs. The
-light has a colour (green or red) and a `switch-time`: the number of seconds
-before it changes colour. `start-green?` sets the first colour.
-Pedestrians walk both ways (orange right, blue left).
+A 40 m walkway crosses a road with a pedestrian traffic light. During red, pedestrians before their curb slow towards a stop line one radius before it. Pedestrians already crossing finish. Outer intervals split exactly at light changes. Existing arrival and destination rules remain.
 
-## HOW THE LIGHT ACTS
+## ANTICIPATION VELOCITY MODEL (AVM)
 
-When the light is red, every pedestrian who has not yet passed its stop
-line (body touching the near curb) gets a stop line. Within about 2.7 m of it
-the desired speed becomes gap / (4 tau): together with the paper's relaxation
-term this gives critical damping for isolated, uncapped, one-dimensional
-motion. That alone does not prevent overshoot for arbitrary incoming speeds
-or crowd pressure. An explicit stop-line boundary prevents a held pedestrian
-from crossing the line and removes inward preferred velocity, then reapplies
-the unchanged speed cap. This boundary and the braking target are scenario
-rules in addition to the paper's social-force equations. Pedestrians already
-past their line when it turns red finish crossing. On green the stop lines are removed and
-the driving term accelerates everyone back towards their desired speed.
+This model uses Xu, Chraibi and Seyfried (2021), Eqs. (1)-(10).
+Pedestrians choose a direction using anticipated neighbour positions, then
+select speed from available headway along that direction:
 
-A step that straddles a light change is split at the exact switching time.
-Both substeps update all pedestrians synchronously; their durations add to
-the selected dt, which is restored after go. The tick counter counts these
-integration substeps; elapsed-seconds is the physical simulation time.
+    speed = min(free-speed, max(0, headway / time-gap))
 
-## WHAT TO LOOK FOR
+There is no social-force acceleration sum and no stored preferred-velocity
+accumulator. The old 1.3-times-desired-speed cap does not apply: the individual
+free speed itself is the maximum. Each pedestrian samples free speed once,
+using mean 1.55 m/s and standard deviation 0.18 m/s by default. Nonpositive
+Gaussian draws are resampled, as in the project initialization.
 
-Expected: on red, pedestrians slow down and queue just before the curb
-(`mean gap to line`, small and positive); `max overshoot` and `held on road`
-stay near zero; on green the speed ratio returns to about 1.
+The Table 3 bidirectional parameter set is used in every scenario:
+repulsion strength k = 6, interaction range D = 0.01 m, time-gap T = 0.6 s,
+turning time tau = 0.3 s, anticipation time = 0.75 s. Radius r = 0.20 m is
+the requested change from the paper's 0.18 m. Thus touching bodies have
+a centre distance of 0.4 m. Actual separation is measured, not enforced by
+a separate pair constraint. The same radius is used for drawing, pair
+headway, wall clearance, door posts and traffic-light stop placement.
 
-## SHARED MODEL
+There is no pedestrian-pair position projection, hidden overlap correction,
+or additional pair repulsion. Pair spacing follows the AVM equations and
+the fixed timestep; overlap diagnostics remain observational.
+The paper chooses a random side for an exactly aligned predicted neighbour;
+this is distinct from the former continuous random-force control.
 
-Forces, integration and walls come from `../core/pedestrians.nls`; correctness
-checks from `../core/checks.nls`; statistics, plots and CSV logging from
-`../core/stats.nls`. Every wall segment exerts the paper's wall force and is
-impenetrable (centres stay `body-radius` = 0.2 m away). `../core/contact.nls`
-adds a joint hard 0.5 m centre-to-centre constraint along the whole step.
-This supplements the unchanged social forces and may produce queues or jams.
+## WALLS AND SCENARIO BOUNDARIES
 
-## CORRECTNESS CHECKS
+The preprint does not specify a wall law. This implementation adds documented
+wall gliding inspired by the authors' JuPedSim implementation: within radius
+plus a 0.1 m buffer, an inward heading component is removed and a 0.3 outward
+component is added before normalization. Wall steering runs BEFORE the final
+pedestrian headway speed calculation so its direction is consistent with it.
+This ordering is our integration choice, not an exact JuPedSim reproduction.
 
-With `run-checks?` on, every step updates: `pass-throughs` (deep swept closest
-approaches below 0.2 m in any direction), `min separation seen`, wall clearance
-and speed-cap violations (|v| > 1.3 v0). `overlapping pairs` counts drawn
-circles overlapping now. With the default pair constraint enabled, minimum
-separation stays at least 0.5 m within numerical tolerance and both counts
-remain zero. `contact-solver-fallbacks` counts safe stops if the solver stalls.
+Wall segments and their round end caps use the pedestrian radius. A swept
+geometric bound can only reduce speed along the selected heading; it does
+not redirect velocity after pair-speed selection or reposition a pedestrian.
+A red stop line uses gap/T and a swept advance bound. No reverse speed or
+random creeping is added. Existing geometry, spawning, destinations and
+routing are scenario choices, not claims of reproducing the paper's entire
+experiment. The crossing remains uncontrolled.
 
-## LOGGING
+## NUMERICS AND CHECKS
 
-With `log-csv?` on, setup writes `../work/<scenario>.csv` (create the `work`
-folder first): every 0.1 s, the mean, standard deviation and sample variance
-of speed, speed / desired speed, forward speed, sideways speed and completed
-travel times.
+Click setup, then go; click go again to pause. Step advances one interval of
+length dt. Heading uses normalized forward Euler, and every pedestrian uses
+the same old-state snapshot before all new states are committed. The physical
+time-gap, anticipation time and turning time are separate parameters.
+
+There is no added pedestrian-distance limit: no pair position projection,
+overlap-based rejection, automatic timestep halving, distance-dependent step
+cap or minimum-separation abort. A step is committed even if it produces
+overlapping bodies. The experiment measures whether AVM's own direction and
+speed equations maintain separation at the chosen dt. The body diameter of
+0.4 m remains in the paper's headway formula; it is not an extra acceptance
+condition. Smaller fixed timesteps can be compared to measure discretization
+sensitivity without imposing a distance threshold.
+
+The traffic-light scenario alone can split an outer interval at its scheduled
+light event. Recorded paths include every resulting segment, periodic seams
+and pedestrians removed at exits. Door passages are collected chronologically.
+
+With run-checks? on, separation and overlap diagnostics only observe the
+generated motion; they never change it or stop a run because people overlap.
+check-invariants still validates finite states, wall clearance and the
+individual free-speed bound. The existing wall and red-stop boundary rules
+remain scenario additions, separate from the pedestrian-pair equations.
+
+Previous results from the version that rejected overlapping steps do not
+establish collision avoidance by AVM alone. See AVM.md for the current
+unconstrained-pair test protocol and results. Scenario plots and CSV logging
+retain their existing sampling cadence.
+
+## SOURCES
+
+Xu, Chraibi and Seyfried (2021), Anticipation in a velocity-based model for
+pedestrian dynamics, especially Eqs. (1)-(10) and Table 3:
+https://arxiv.org/pdf/2107.00624
+
+Author project explanation distinguishing JuPedSim wall handling:
+https://pedestriandynamics.org/models/anticipation_velocity_model/
+
+The JuPedSim implementation also contains a pair buffer and random creep;
+those additions are not adopted in this paper-based implementation.
 ]]></info>
   <turtleShapes>
     <shape name="default" rotatable="false" editableColorIndex="0">
@@ -380,12 +421,6 @@ travel times.
         <metric>wall-penetration-count</metric>
       </metrics>
       <constants>
-        <enumeratedValueSet variable="relative-anticipation?">
-            <value value="true"></value>
-          </enumeratedValueSet>
-        <enumeratedValueSet variable="noise-strength">
-            <value value="0"></value>
-          </enumeratedValueSet>
         <enumeratedValueSet variable="dt">
             <value value="0.02"></value>
           </enumeratedValueSet>
@@ -399,10 +434,10 @@ travel times.
             <value value="false"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="mean-desired-speed">
-            <value value="1.34"></value>
+            <value value="1.55"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="desired-speed-sd">
-            <value value="0.26"></value>
+            <value value="0.18"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="initial-per-side">
             <value value="10"></value>

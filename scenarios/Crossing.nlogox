@@ -8,9 +8,9 @@
 ; an object: it emerges from where the walls and the flows are placed.
 ; Shared model: ../core/pedestrians.nls.
 ; Interface variables: dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, relative-anticipation?,
+; simulation-seed, show-trails?,
 ; run-checks?, log-csv?, corridor-width, horizontal-rate, vertical-rate,
-; two-way?.
+; two-way?, crossing-yielding?.
 ;
 ; Geometry (metres): a 30 x 30 m world. A horizontal and a vertical corridor,
 ; each corridor-width wide, cross in a square centred at (15, 15). Exit
@@ -20,18 +20,22 @@
 ; distance / desired speed) and time spent standing, so the delay caused by
 ; the crossing can be compared between the two flows.
 
-__includes [ "../core/pedestrians.nls" "../core/contact.nls" "../core/checks.nls" "../core/stats.nls" ]
+__includes [ "../core/pedestrians.nls" "../core/avm.nls" "../core/boundaries.nls" "../core/checks.nls" "../core/stats.nls" ]
 
 globals [
   center half-width       ; middle of the crossing; half the corridor width
   open-bottom open-top    ; exit planes of the vertical corridor
   horizontal-results      ; [travel-time free-time slow-seconds] per arrival
   vertical-results
+  active-crossing-yielding? crossing-green-vertical? crossing-draining?
+  crossing-phase-start-seconds crossing-admissions crossing-phase-count
+  crossing-batch-size crossing-phase-duration crossing-switch-log
 ]
 
 turtles-own [
   vertical?               ; walking up/down instead of left/right
   free-time               ; straight-line distance / desired speed at creation
+  crossing-admitted? crossing-cleared?
 ]
 
 ; Build the plus-shaped walkable area; no pedestrians exist at the start.
@@ -67,6 +71,17 @@ to setup
   draw-walls black
   set horizontal-results []
   set vertical-results []
+  set active-crossing-yielding? crossing-yielding?
+  set crossing-green-vertical? false
+  set crossing-draining? false
+  set crossing-phase-start-seconds 0
+  set crossing-admissions 0
+  set crossing-phase-count 0
+  ; Finite admission phases retain capacity at 1.8 attempts/s in each stream.
+  ; These are explicit scenario coordination parameters, not AVM parameters.
+  set crossing-batch-size 64
+  set crossing-phase-duration 20
+  set crossing-switch-log []
   random-seed simulation-seed
   if log-csv? [log-start "../work/crossing.csv"]
   reset-ticks
@@ -75,13 +90,20 @@ end
 ; One integration step: arrivals in both corridors, detours for displaced
 ; walkers, motion, checks and logging.
 to go
+  checks-begin-step
   ped-check-parameters
   if horizontal-rate < 0 or vertical-rate < 0 [error "Arrival rates must not be negative."]
   ; Independent Poisson arrivals for each corridor (rates per second).
   repeat random-poisson (horizontal-rate * dt) [spawn-walker false]
   repeat random-poisson (vertical-rate * dt) [spawn-walker true]
-  foreach sort pedestrians [p -> ask p [reroute-if-displaced]]
+  crossing-update-membership
+  crossing-update-controller
+  foreach sort pedestrians [p -> ask p [
+    reroute-if-displaced
+    crossing-apply-gate
+  ]]
   ped-step
+  crossing-update-membership
   if run-checks? [checks-update]
   log-row
 end
@@ -128,6 +150,8 @@ to spawn-walker [is-vertical?]
   create-pedestrians 1 [
     initialize-pedestrian item 0 spot item 1 spot item 0 goal item 1 goal direction
     set vertical? is-vertical?
+    set crossing-admitted? false
+    set crossing-cleared? false
     ; Vertical walkers: green going up, violet going down.
     if vertical? [set color ifelse-value (direction = 1) [green - 1] [violet]]
     set free-time vector-length (goal-x - xcor) (goal-y - ycor) / desired-speed
@@ -135,26 +159,140 @@ to spawn-walker [is-vertical?]
   set spawned-count spawned-count + 1
 end
 
-; Crowd pressure in the shared square can push a walker out of its own
-; corridor band into an arm of the other corridor. From there the straight
-; line to its goal runs into a wall, and steering straight at the goal pins
-; it against that wall. While displaced, it heads for its own corridor's
-; centre line inside the square instead; the detour ends once it is back
-; inside its band by a margin (hysteresis avoids flickering at the edge).
-to reroute-if-displaced
-  ; Distance from the centre line of the walker's own corridor.
-  let offset ifelse-value vertical? [abs (xcor - center)] [abs (ycor - center)]
-  let margin min (list 0.5 (half-width / 2))
-  if offset > half-width [
-    ; Waypoint: on the own centre line, at the current position along the
-    ; other axis clamped into the shared square.
-    let lo center - half-width + margin
-    let hi center + half-width - margin
-    set waypoints ifelse-value vertical?
-      [(list (list center (max (list lo min (list hi ycor)))))]
-      [(list (list (max (list lo min (list hi xcor))) center))]
+; Explicit yielding coordination, outside the AVM equations. The two streams
+; alternate finite admission phases. Closing a phase holds only walkers that
+; have not crossed its gate; everyone already admitted may finish crossing.
+; The opposite stream opens only after all admitted bodies have left the
+; shared region. No pairwise projection, minimum-gap rule or forced motion is
+; used. The usual scalar stop-plane rule is applied before position updates.
+to crossing-update-controller
+  if not active-crossing-yielding? [stop]
+  if not crossing-draining? and
+     (crossing-admissions >= crossing-batch-size or
+      elapsed-seconds - crossing-phase-start-seconds >= crossing-phase-duration) [
+    set crossing-draining? true
   ]
-  if offset < half-width - margin [set waypoints []]
+  if crossing-draining? and crossing-unfinished-count = 0 [
+    set crossing-green-vertical? not crossing-green-vertical?
+    set crossing-draining? false
+    set crossing-phase-start-seconds elapsed-seconds
+    set crossing-switch-log lput
+      (list elapsed-seconds crossing-green-vertical? crossing-admissions crossing-unfinished-count)
+      crossing-switch-log
+    set crossing-admissions 0
+    set crossing-phase-count crossing-phase-count + 1
+  ]
+end
+
+to crossing-update-membership
+  if not active-crossing-yielding? [stop]
+  foreach sort pedestrians [p -> ask p [
+    let along ifelse-value vertical? [ycor] [xcor]
+    let across ifelse-value vertical? [xcor] [ycor]
+    if not crossing-admitted? and
+       travel-direction * (along - crossing-gate-coordinate) > 1e-8 [
+      set crossing-admitted? true
+      set crossing-admissions crossing-admissions + 1
+    ]
+    ; Recompute the physical clearance rather than trusting an old passage.
+    set crossing-cleared? crossing-admitted? and
+      travel-direction * (along - crossing-clear-coordinate) >= 0 and
+      abs (across - center) <= half-width - body-radius + 1e-8
+  ]]
+end
+
+to crossing-apply-gate
+  set stop-x false
+  set stop-y false
+  if not active-crossing-yielding? or crossing-admitted? [stop]
+  if crossing-draining? or vertical? != crossing-green-vertical? [
+    ifelse vertical?
+      [set stop-y crossing-gate-coordinate]
+      [set stop-x crossing-gate-coordinate]
+  ]
+end
+
+to-report crossing-gate-coordinate
+  report center - travel-direction * (half-width + body-radius + avm-wall-buffer + 0.5)
+end
+
+to-report crossing-clear-coordinate
+  report center + travel-direction * (half-width + body-radius + avm-wall-buffer)
+end
+
+to-report crossing-unfinished-count
+  report count pedestrians with [crossing-admitted? and not crossing-cleared?]
+end
+
+to-report crossing-control-status
+  if not active-crossing-yielding? [report "uncontrolled"]
+  report word (ifelse-value crossing-green-vertical? ["vertical"] ["horizontal"])
+    (ifelse-value crossing-draining? [" clearing"] [" admitting"])
+end
+
+; Supply AVM's desired direction in two geometric stages: the nearest point
+; of the outgoing corridor portal, then the unchanged random final goal.
+; The portal spans the usable corridor width; no lane or stream has priority.
+; If a corner blocks the direct route, select the shortest visible path via
+; an inset corner of the central square. AVM still selects direction and speed.
+to reroute-if-displaced
+  set waypoints []
+  let clearance body-radius + avm-wall-buffer
+  let lo center - half-width + clearance
+  let hi center + half-width - clearance
+  let target-x goal-x
+  let target-y goal-y
+  let portal center + travel-direction * (half-width + clearance)
+  let along ifelse-value vertical? [ycor] [xcor]
+  if travel-direction * along < travel-direction * portal [
+    ifelse vertical? [
+      set target-y portal
+      set target-x max (list lo min (list hi xcor))
+    ] [
+      set target-x portal
+      set target-y max (list lo min (list hi ycor))
+    ]
+  ]
+  ifelse crossing-route-clear? xcor ycor target-x target-y [
+    if target-x != goal-x or target-y != goal-y [crossing-aim-at target-x target-y]
+  ] [
+    let best false
+    let shortest 1e100
+    foreach (list (list lo lo) (list lo hi) (list hi lo) (list hi hi)) [point ->
+      let px item 0 point
+      let py item 1 point
+      if crossing-route-clear? xcor ycor px py and
+         crossing-route-clear? px py target-x target-y [
+        let length-now (vector-length (px - xcor) (py - ycor)) +
+                       (vector-length (target-x - px) (target-y - py))
+        if length-now < shortest [set shortest length-now set best point]
+      ]
+    ]
+    if best != false [crossing-aim-at item 0 best item 1 best]
+  ]
+end
+
+; Extend a short routing target along the same ray. This retains its unit
+; desired direction while preventing the shared .5 m waypoint-arrival radius
+; from dropping a corner/portal target before the geometric handoff is clear.
+to crossing-aim-at [target-x target-y]
+  let dx-target target-x - xcor
+  let dy-target target-y - ycor
+  let length-now vector-length dx-target dy-target
+  if length-now > epsilon [
+    let scale max (list 1 ((waypoint-radius + 1e-6) / length-now))
+    set waypoints (list (list (xcor + scale * dx-target) (ycor + scale * dy-target)))
+  ]
+end
+
+; A straight route for the pedestrian's disk, including the round wall ends.
+; This is obstacle visibility for navigation, not a pedestrian gap constraint.
+to-report crossing-route-clear? [from-x from-y to-x to-y]
+  let clear? true
+  foreach wall-segments [wall ->
+    if avm-swept-wall-contact from-x from-y to-x to-y wall != false [set clear? false]
+  ]
+  report clear?
 end
 
 ; A position across a corridor, 0.5 m clear of its walls.
@@ -209,18 +347,20 @@ end
     <button x="90" y="10" width="75" height="40" display="go" kind="Observer" forever="true" disableUntilTicks="true">go</button>
     <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
     <slider x="10" y="60" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
-    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
-    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
-    <slider x="10" y="225" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0" direction="Horizontal" units="m/s^2" />
+    <slider x="10" y="115" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.01" default="1.55" direction="Horizontal" units="m/s" />
+    <slider x="10" y="170" width="235" height="50" display="desired-speed-sd" variable="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.18" direction="Horizontal" units="m/s" />
+    <monitor x="10" y="225" width="235" height="50" display="body radius (m)" precision="2" fontSize="11">body-radius</monitor>
     <slider x="10" y="280" width="235" height="50" display="simulation-seed" variable="simulation-seed" min="0" max="1000" step="1" default="42" direction="Horizontal" units="setup" />
-    <switch x="10" y="335" width="235" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
+    <monitor x="10" y="335" width="235" height="40" display="anticipation (s)" precision="2" fontSize="11">anticipation-time</monitor>
     <switch x="10" y="380" width="235" height="40" on="true" variable="run-checks?" display="run-checks?" />
     <switch x="10" y="425" width="235" height="40" on="false" variable="show-trails?" display="show-trails?" />
     <switch x="10" y="470" width="235" height="40" on="false" variable="log-csv?" display="log-csv?" />
     <slider x="10" y="520" width="235" height="50" display="corridor-width" variable="corridor-width" min="1" max="10" step="0.5" default="4" direction="Horizontal" units="m" />
-    <slider x="10" y="575" width="235" height="50" display="horizontal-rate" variable="horizontal-rate" min="0" max="3" step="0.1" default="0.8" direction="Horizontal" units="attempts/s" />
-    <slider x="10" y="630" width="235" height="50" display="vertical-rate" variable="vertical-rate" min="0" max="3" step="0.1" default="0.8" direction="Horizontal" units="attempts/s" />
+    <slider x="10" y="575" width="235" height="50" display="horizontal-rate" variable="horizontal-rate" min="0" max="3" step="0.1" default="1.8" direction="Horizontal" units="attempts/s" />
+    <slider x="10" y="630" width="235" height="50" display="vertical-rate" variable="vertical-rate" min="0" max="3" step="0.1" default="1.8" direction="Horizontal" units="attempts/s" />
     <switch x="10" y="685" width="235" height="40" on="false" variable="two-way?" display="two-way?" />
+    <switch x="10" y="730" width="235" height="40" on="true" variable="crossing-yielding?" display="crossing-yielding?" />
+    <monitor x="10" y="775" width="235" height="50" display="crossing phase" precision="0" fontSize="11">crossing-control-status</monitor>
     <monitor x="265" y="494" width="150" height="55" display="simulated seconds" precision="2" fontSize="11">elapsed-seconds</monitor>
     <monitor x="425" y="494" width="150" height="55" display="walking" precision="0" fontSize="11">count pedestrians</monitor>
     <monitor x="585" y="494" width="150" height="55" display="arrived" precision="0" fontSize="11">arrived-count</monitor>
@@ -266,64 +406,114 @@ end
         <update>if stats-sample? and not empty? speeds-of "vertical" [plotxy elapsed-seconds mean speeds-of "vertical"]</update>
       </pen>
     </plot>
+    <monitor x="275" y="959" width="190" height="55" display="integration segments" precision="0" fontSize="11">length last-internal-step-paths</monitor>
+    <monitor x="475" y="959" width="190" height="55" display="shortest segment (s)" precision="8" fontSize="11">ifelse-value (empty? last-internal-step-paths) [0] [min map [entry -&gt; item 1 entry] last-internal-step-paths]</monitor>
+    <monitor x="275" y="1029" width="190" height="55" display="repulsion k" precision="3" fontSize="11">avm-strength</monitor>
+    <monitor x="475" y="1029" width="190" height="55" display="range D (m)" precision="3" fontSize="11">avm-range</monitor>
+    <monitor x="675" y="1029" width="190" height="55" display="time gap T (s)" precision="3" fontSize="11">avm-time-gap</monitor>
+    <monitor x="875" y="1029" width="190" height="55" display="turning tau (s)" precision="3" fontSize="11">tau</monitor>
   </widgets>
-  <info><![CDATA[## WHAT IS IT?
+  <info><![CDATA[## CROSSING
 
-Two corridors (`corridor-width` wide) cross at right angles in a 30 x 30 m
-area. Horizontal walkers (orange right, blue left) and vertical walkers
-(green up, violet down) arrive at `horizontal-rate` and `vertical-rate`
-attempts per second. With `two-way?` off, all walk right or up. The crossing
-is not an object: it is where the two flows share the central square.
+Two corridors cross at right angles in a 30 by 30 m world. Defaults are 4 m corridor width and 1.8 horizontal plus 1.8 vertical arrival attempts per second. Each rate is the total for its corridor. The random final destinations are retained. There is no yielding, priority or light controller.
 
-## WHAT TO LOOK FOR
+Geometry supplies AVM's desired direction using the nearest point of the
+outgoing corridor portal while approaching and traversing the intersection.
+Once inside the outgoing arm, pedestrians head for their original random
+final destination. The portal is a continuous interval across the corridor,
+not an assigned lane. If a wall corner blocks the route, an inset visible
+corner supplies the detour. Short routing targets are retained until the
+route is clear, rather than dropped by the generic waypoint-arrival radius.
+This navigation is a scenario choice outside Eqs. (1)-(10); it changes neither
+AVM's pedestrian interactions nor its speed law and adds no pair-distance rule.
 
-The question is how the crossing affects walking speed and travel time, and
-whether pedestrians get through without stopping.
+## ANTICIPATION VELOCITY MODEL (AVM)
 
-- `travel time H/V`: mean time from entering to leaving, per direction.
-- `delay ratio H/V`: travel time divided by the free-walking time
-  (straight-line distance / desired speed); 1 means never slowed down.
-- `stopped H/V`: fraction of arrivals that stood still (below 0.1 m/s) at
-  some point after first reaching half their desired speed.
+This model uses Xu, Chraibi and Seyfried (2021), Eqs. (1)-(10).
+Pedestrians choose a direction using anticipated neighbour positions, then
+select speed from available headway along that direction:
 
-Compare with `vertical-rate` = 0 (no crossing traffic): the
-`crossing-flow-sweep` experiment does this.
+    speed = min(free-speed, max(0, headway / time-gap))
 
-## DISPLACED WALKERS
+There is no social-force acceleration sum and no stored preferred-velocity
+accumulator. The old 1.3-times-desired-speed cap does not apply: the individual
+free speed itself is the maximum. Each pedestrian samples free speed once,
+using mean 1.55 m/s and standard deviation 0.18 m/s by default. Nonpositive
+Gaussian draws are resampled, as in the project initialization.
 
-Pedestrians steer straight at their goal. In a crowded square, someone can be
-pushed out of their own corridor into an arm of the other corridor; the
-straight line to the goal then runs into a wall and they would stay pinned
-against it. While a walker is outside its own corridor band it therefore
-heads for its corridor's centre line inside the square first, and resumes
-heading for its goal once it is back inside the band by
-min(0.5 m, corridor-width / 4). Walkers inside their own corridor are never
-affected.
+The Table 3 bidirectional parameter set is used in every scenario:
+repulsion strength k = 6, interaction range D = 0.01 m, time-gap T = 0.6 s,
+turning time tau = 0.3 s, anticipation time = 0.75 s. Radius r = 0.20 m is
+the requested change from the paper's 0.18 m. Thus touching bodies have
+a centre distance of 0.4 m. Actual separation is measured, not enforced by
+a separate pair constraint. The same radius is used for drawing, pair
+headway, wall clearance, door posts and traffic-light stop placement.
 
-## SHARED MODEL
+There is no pedestrian-pair position projection, hidden overlap correction,
+or additional pair repulsion. Pair spacing follows the AVM equations and
+the fixed timestep; overlap diagnostics remain observational.
+The paper chooses a random side for an exactly aligned predicted neighbour;
+this is distinct from the former continuous random-force control.
 
-Forces, integration and walls come from `../core/pedestrians.nls`; correctness
-checks from `../core/checks.nls`; statistics, plots and CSV logging from
-`../core/stats.nls`. Every wall segment exerts the paper's wall force and is
-impenetrable (centres stay `body-radius` = 0.2 m away). `../core/contact.nls`
-adds a joint hard 0.5 m centre-to-centre constraint along the whole step.
-This supplements the unchanged social forces and may produce queues or jams.
+## WALLS AND SCENARIO BOUNDARIES
 
-## CORRECTNESS CHECKS
+The preprint does not specify a wall law. This implementation adds documented
+wall gliding inspired by the authors' JuPedSim implementation: within radius
+plus a 0.1 m buffer, an inward heading component is removed and a 0.3 outward
+component is added before normalization. Wall steering runs BEFORE the final
+pedestrian headway speed calculation so its direction is consistent with it.
+This ordering is our integration choice, not an exact JuPedSim reproduction.
 
-With `run-checks?` on, every step updates: `pass-throughs` (deep swept closest
-approaches below 0.2 m in any direction), `min separation seen`, wall clearance
-and speed-cap violations (|v| > 1.3 v0). `overlapping pairs` counts drawn
-circles overlapping now. With the default pair constraint enabled, minimum
-separation stays at least 0.5 m within numerical tolerance and both counts
-remain zero. `contact-solver-fallbacks` counts safe stops if the solver stalls.
+Wall segments and their round end caps use the pedestrian radius. A swept
+geometric bound can only reduce speed along the selected heading; it does
+not redirect velocity after pair-speed selection or reposition a pedestrian.
+A red stop line uses gap/T and a swept advance bound. No reverse speed or
+random creeping is added. Existing geometry, spawning, destinations and
+routing are scenario choices, not claims of reproducing the paper's entire
+experiment. The crossing remains uncontrolled.
 
-## LOGGING
+## NUMERICS AND CHECKS
 
-With `log-csv?` on, setup writes `../work/<scenario>.csv` (create the `work`
-folder first): every 0.1 s, the mean, standard deviation and sample variance
-of speed, speed / desired speed, forward speed, sideways speed and completed
-travel times.
+Click setup, then go; click go again to pause. Step advances one interval of
+length dt. Heading uses normalized forward Euler, and every pedestrian uses
+the same old-state snapshot before all new states are committed. The physical
+time-gap, anticipation time and turning time are separate parameters.
+
+There is no added pedestrian-distance limit: no pair position projection,
+overlap-based rejection, automatic timestep halving, distance-dependent step
+cap or minimum-separation abort. A step is committed even if it produces
+overlapping bodies. The experiment measures whether AVM's own direction and
+speed equations maintain separation at the chosen dt. The body diameter of
+0.4 m remains in the paper's headway formula; it is not an extra acceptance
+condition. Smaller fixed timesteps can be compared to measure discretization
+sensitivity without imposing a distance threshold.
+
+The traffic-light scenario alone can split an outer interval at its scheduled
+light event. Recorded paths include every resulting segment, periodic seams
+and pedestrians removed at exits. Door passages are collected chronologically.
+
+With run-checks? on, separation and overlap diagnostics only observe the
+generated motion; they never change it or stop a run because people overlap.
+check-invariants still validates finite states, wall clearance and the
+individual free-speed bound. The existing wall and red-stop boundary rules
+remain scenario additions, separate from the pedestrian-pair equations.
+
+Previous results from the version that rejected overlapping steps do not
+establish collision avoidance by AVM alone. See AVM.md for the current
+unconstrained-pair test protocol and results. Scenario plots and CSV logging
+retain their existing sampling cadence.
+
+## SOURCES
+
+Xu, Chraibi and Seyfried (2021), Anticipation in a velocity-based model for
+pedestrian dynamics, especially Eqs. (1)-(10) and Table 3:
+https://arxiv.org/pdf/2107.00624
+
+Author project explanation distinguishing JuPedSim wall handling:
+https://pedestriandynamics.org/models/anticipation_velocity_model/
+
+The JuPedSim implementation also contains a pair buffer and random creep;
+those additions are not adopted in this paper-based implementation.
 ]]></info>
   <turtleShapes>
     <shape name="default" rotatable="false" editableColorIndex="0">
@@ -358,12 +548,6 @@ travel times.
         <metric>wall-penetration-count</metric>
       </metrics>
       <constants>
-        <enumeratedValueSet variable="relative-anticipation?">
-            <value value="true"></value>
-          </enumeratedValueSet>
-        <enumeratedValueSet variable="noise-strength">
-            <value value="0"></value>
-          </enumeratedValueSet>
         <enumeratedValueSet variable="dt">
             <value value="0.02"></value>
           </enumeratedValueSet>
@@ -377,10 +561,10 @@ travel times.
             <value value="false"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="mean-desired-speed">
-            <value value="1.34"></value>
+            <value value="1.55"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="desired-speed-sd">
-            <value value="0.26"></value>
+            <value value="0.18"></value>
           </enumeratedValueSet>
         <enumeratedValueSet variable="horizontal-rate">
             <value value="0.8"></value>

@@ -1,210 +1,112 @@
-; =============================================================================
-; core/pedestrians.nls -- pedestrian social-force core
-; =============================================================================
-; Pedestrian social-force core, shared by every scenario model via __includes.
-; Coordinates: metres. Velocity: m/s. Acceleration: m/s^2.
+; AVM: Xu, Chraibi & Seyfried (2021), Eqs. (1)-(10).
+; Position in metres, speed in m/s, times in seconds. Shared by all scenarios.
+; Actual heading is an independent state even when speed is zero. Steering,
+; heading relaxation and the gap-based speed law are in avm.nls. There is no
+; social-force acceleration integration and no pedestrian position projection.
+; Boundaries/routing are explicit project additions; see AVM.md.
 ;
-; This file implements the social force model of Helbing & Molnar (1995).
-; Each pedestrian i feels the sum of:
-;   - a driving term pulling its velocity towards desired-speed * e_i (Eq. 2),
-;   - an elliptical repulsion from every other pedestrian, weighted by
-;     whether the other person is in front of or behind them (Eqs. 3 and 5),
-;   - an exponential repulsion from every wall segment (Eq. 4),
-;   - an optional constant random force (Eq. 6).
-; The sum is the acceleration of the "preferred" velocity w. The actual
-; velocity v is w capped at 1.3 * desired-speed (Eq. 8), and the position
-; moves with v (Eq. 9).
-;
-; Integration is semi-implicit (symplectic) Euler with step dt:
-;   w(t+dt) = w(t) + dt * a(t)
-;   v(t+dt) = cap(w(t+dt))
-;   x(t+dt) = x(t) + dt * v(t+dt)
-; Every pedestrian computes its acceleration from the same time-t state.
-; New values are written to next-* buffers and committed together at the
-; end of the step, so the result does not depend on the order agents run in.
-;
-; This file never defines setup or go: each scenario model owns those and
-; calls ped-init-constants, ped-check-parameters and ped-step.
-;
-; Interface contract. These names are USED here but must be DECLARED by the
-; including model, either as a widget or in its own globals [...]:
-;   dt, mean-desired-speed, desired-speed-sd, noise-strength,
-;   relative-anticipation?, show-trails?
-;
-; Required hook. Every including model must define this procedure. It runs in
-; pedestrian context inside finalize-next-state, after joint contact and the goal-disk test,
-; and may set reached-goal? (left successfully) or returned? (left backwards)
-; from the buffered next-x/next-y:
-;   to scenario-exit-check ... end
-;
-; Geometry is data: wall-segments is a list of [x1 y1 x2 y2] segments. Each
-; one exerts the wall force and is impenetrable to a pedestrian's centre
-; closer than body-radius (apply-wall-contact). Optional x-periodicity:
-; set active-periodic? true and hall-length to the period.
-;
-; Per-pedestrian steering options (set by scenarios, off by default):
-;   waypoints  list of [x y] visited in order before goal-x/goal-y
-;   stop-x     false, or an x the pedestrian brakes to and waits at
-;
-; Order of one integration step (ped-step):
-;   1. update-desired-direction   e_i from position, waypoints and goal
-;   2. calculate-acceleration     a_i = driving + pair + wall + noise forces
-;   3. propose-next-state         candidate w, v, x, with hard wall contact
-;   4. resolve-pedestrian-contacts (core/contact.nls) joint 0.5 m clearance
-;   5. finalize-next-state        periodic wrap, goal disk and exit hook
-;   6. commit-next-state          copy buffers into the state, remove leavers
+; Widget contract: dt, mean-desired-speed, desired-speed-sd, show-trails?.
+; Model hook: scenario-exit-check acts on accepted next-x/next-y only.
+; All agents use one immutable old-state snapshot per internal Euler step.
 
 breed [pedestrians pedestrian]
 
 globals [
-  ; --- model constants (set in ped-init-constants) ---
-  tau anticipation-time potential-strength sigma   ; relaxation time; T; V^0; sigma
-  wall-strength wall-range view-half-angle rear-weight ; wall force U^0/R; R; phi; c
+  tau anticipation-time avm-strength avm-range avm-time-gap
   epsilon arrival-radius wall-segments elapsed-seconds arrived-count
-  ; epsilon        softening length for divisions near zero (m)
-  ; arrival-radius distance from the goal that counts as arriving (m)
-  ; wall-segments  list of [x1 y1 x2 y2] wall segments (m)
-  ; elapsed-seconds simulated time; advances by dt every ped-step
-  ; arrived-count  pedestrians that reached their goal or exit and were removed
   spawned-count blocked-spawn-count entrance-clearance
-  ; spawned-count       pedestrians created so far
-  ; blocked-spawn-count spawn attempts skipped because the entrance was full
-  ; entrance-clearance  minimum centre distance when placing a new pedestrian
-  hall-bottom hall-top body-radius returned-count
-  ; hall-bottom/top  y of the lower and upper walkway walls (scenario-specific)
-  ; body-radius      hard radius: no centre gets closer than this to a wall
-  ; returned-count   pedestrians pushed back out through their own entrance
-  hall-length active-periodic? wrap-count
-  ; hall-length      x-extent of the walkway; also the period when periodic
-  ; active-periodic? x-periodic walkway, fixed at setup
-  ; wrap-count       total number of seam crossings (periodic mode)
-  open-left open-right active-relative-anticipation?
-  ; open-left/right  x of the left and right exit planes in open mode
-  ; active-relative-anticipation? copy of the switch, captured at setup only
-  waypoint-radius stop-speed
-  ; waypoint-radius  distance at which a waypoint counts as visited (m)
-  ; stop-speed       speed below which a pedestrian counts as standing (m/s)
-  travel-times arrival-slow-seconds   ; one entry per arrived pedestrian
-  last-step-paths                    ; [who start-x start-y unwrapped-end-x end-y]
-  last-step-start-seconds last-step-duration ; time interval of the last ped-step
+  hall-bottom hall-top body-radius returned-count hall-length active-periodic? wrap-count
+  open-left open-right waypoint-radius stop-speed travel-times arrival-slow-seconds
+  last-step-paths last-step-start-seconds last-step-duration last-internal-step-paths
+  avm-accepted-steps avm-rejected-steps avm-last-min-step
+  avm-reverse-calculation? avm-wall-buffer
+  ; Compatibility fields for existing scenario commands/diagnostics only.
+  ; These do not select another model or activate pair contact in AVM.
+  noise-strength relative-anticipation? active-relative-anticipation?
+  pair-contact-enabled? minimum-separation contact-step-count contact-solver-fallbacks
 ]
 
 pedestrians-own [
-  desired-speed                ; v_i^0, sampled once at creation and retained
-  goal-x goal-y                 ; destination x_i^0
-  ex ey                         ; desired unit direction e_i
-  wx wy                         ; preferred velocity w_i (kept between steps)
-  vx vy                         ; actual, speed-limited velocity v_i
-  ax ay                         ; acceleration dw_i/dt
-  noise-unit-x noise-unit-y     ; random unit direction, sampled once at setup
-  next-wx next-wy next-vx next-vy next-x next-y ; buffered state for time t + dt
-  reached-goal?                ; set during the step: leaves as an arrival
-  returned?                    ; set during the step: leaves backwards
-  travel-direction             ; +1 right, -1 left; fixed for each pedestrian
-  next-wrap-count              ; buffered seam crossings, committed once per step
-  waypoints                    ; remaining [x y] waypoints before the goal
-  stop-x                       ; false, or x-coordinate to stop at (e.g. red light)
-  drive-factor                 ; scales desired speed near stop-x; otherwise 1
-  birth-seconds                ; creation time, for travel times
-  started?                     ; has reached half its desired speed once
-  slow-seconds                 ; time spent below stop-speed after starting
-  previous-x previous-y         ; physical position before this integration step
-  step-end-x step-end-y         ; corrected endpoint before periodic wrapping
+  desired-speed goal-x goal-y ex ey move-ex move-ey
+  vx vy ax ay wx wy noise-unit-x noise-unit-y
+  next-vx next-vy next-wx next-wy next-x next-y next-move-ex next-move-ey
+  reached-goal? returned? travel-direction next-wrap-count waypoints stop-x stop-y drive-factor
+  birth-seconds started? slow-seconds previous-x previous-y step-end-x step-end-y
+  avm-ties avm-neighbor-rows
 ]
 
-; Physical and numerical constants. Call after clear-all in every scenario setup.
 to ped-init-constants
-  ; Example settings for quantities left unspecified in the report.
-  set tau 0.5                   ; relaxation time of the driving term (s)
-  set anticipation-time 2       ; T in seconds, independent of numerical step dt
-  set potential-strength 2.1   ; V^0, units m^2/s^2
-  set sigma 0.3                ; interaction range, metres
-  set view-half-angle 100      ; phi; NetLogo trigonometry uses degrees
-  set rear-weight 0.5          ; c
-  set epsilon 0.000001         ; length softening at singular geometries
-  set arrival-radius 0.3       ; metres
-  set entrance-clearance 0.6   ; minimum initial separation at an entrance
-  set body-radius 0.2          ; hard wall clearance; social forces are unchanged
-  ; Equation (4): values explicitly given in your report.
-  ; wall-strength is U^0 / R, the force magnitude at distance 0 (m/s^2);
-  ; wall-range is R, the distance over which the force decays by a factor e.
-  set wall-strength 50
-  set wall-range 0.2
-  set active-relative-anticipation? relative-anticipation? ; fixed on setup
-  ; Scenario-independent defaults; scenarios override after this call.
+  ; Table 3 calibrated bidirectional settings; radius changed at user request.
+  set avm-strength 6
+  set avm-range 0.01
+  set avm-time-gap 0.6
+  set tau 0.3
+  set anticipation-time 0.75
+  set body-radius 0.2
+  set epsilon 1e-12
+  set entrance-clearance 0.6
+  set arrival-radius 0.3
+  set waypoint-radius 0.5
+  set stop-speed 0.1
+  set avm-wall-buffer 0.1
+  set avm-reverse-calculation? false
+  set avm-accepted-steps 0
+  set avm-rejected-steps 0
+  set avm-last-min-step dt
   set active-periodic? false
   set wall-segments []
-  set waypoint-radius 0.5      ; a waypoint counts as passed within this distance
-  set stop-speed 0.1           ; below this speed (m/s) a pedestrian counts as stopped
   set travel-times []
   set arrival-slow-seconds []
   set last-step-paths []
+  set last-internal-step-paths []
   set last-step-start-seconds 0
   set last-step-duration 0
-  contact-init                 ; defaults of the hard pair constraint (contact.nls)
+  set noise-strength 0
+  set relative-anticipation? true
+  set active-relative-anticipation? true
+  set pair-contact-enabled? false
+  set minimum-separation 2 * body-radius
+  set contact-step-count 0
+  set contact-solver-fallbacks 0
 end
 
-; True when a new pedestrian centred at (px, py) keeps entrance-clearance
-; from everyone already present (periodic-aware).
+to ped-check-parameters
+  if dt <= 0 or tau <= 0 or avm-time-gap <= 0 or avm-range <= 0 or body-radius <= 0
+    [error "AVM timestep, turning time, time gap, interaction range and radius must be positive."]
+  if anticipation-time < 0 or avm-strength < 0 or avm-wall-buffer < 0
+    [error "AVM anticipation, steering strength and wall buffer must be nonnegative."]
+  if pair-contact-enabled? [error "AVM uses body size in its speed law; the legacy pair projection must stay disabled."]
+  if noise-strength != 0 [error "AVM has no random force. Only the paper's aligned-encounter side choice is random."]
+end
+
+to-report placement-clearance
+  report max (list entrance-clearance (2 * body-radius + 1e-9))
+end
+
 to-report ped-clear-at? [px py]
   let clearance placement-clearance
-  report not any? pedestrians with [separation-from px py < clearance]
+  if any? pedestrians with [separation-from px py < clearance] [report false]
+  foreach wall-segments [wall ->
+    let nearest nearest-point-on-segment px py wall
+    if vector-length (px - item 0 nearest) (py - item 1 nearest) < body-radius [report false]
+  ]
+  report true
 end
 
-; Required centre distance for placing a new pedestrian. With hard pair
-; contact on, a placement must also respect minimum-separation, otherwise
-; the contact solver would reject the starting configuration.
-to-report placement-clearance
-  if not pair-contact-enabled? [report entrance-clearance]
-  report max (list entrance-clearance minimum-separation)
-end
-
-; Guard against parameter values that would divide by zero or reverse time.
-to ped-check-parameters
-  if dt <= 0 or tau <= 0 or sigma <= 0 or wall-range <= 0
-    [error "dt, tau, sigma and wall-range must be positive."]
-end
-
-; One integration step for all pedestrians.
-to ped-step
-  ; Remember the time interval this step covers; stats.nls uses it to decide
-  ; whether the step crossed a sampling boundary.
-  set last-step-start-seconds elapsed-seconds
-  set last-step-duration dt
-  ; Separate passes ensure everyone uses the same time-t state. Resolve contact
-  ; jointly on candidate paths before checking exits or committing any motion.
-  ; Ordered passes also avoid introducing random ask order.
-  foreach sort pedestrians [p -> ask p [update-desired-direction]]
-  foreach sort pedestrians [p -> ask p [calculate-acceleration]]
-  foreach sort pedestrians [p -> ask p [propose-next-state]]
-  resolve-pedestrian-contacts
-  foreach sort pedestrians [p -> ask p [finalize-next-state]]
-  ; Capture departures too: commit-next-state may remove them immediately.
-  ; Each row is [who start-x start-y end-x end-y]; the end is not wrapped, so
-  ; a seam crossing still looks like one continuous straight move.
-  set last-step-paths map [p -> [(list who previous-x previous-y step-end-x step-end-y)] of p] sort pedestrians
-  foreach sort pedestrians [p -> ask p [commit-next-state]]
-  set elapsed-seconds elapsed-seconds + dt
-  tick                        ; one tick = one integration step
-end
-
-; Initialize a freshly created pedestrian (call inside create-pedestrians).
-; initial-x/y: start position; target-x/y: goal; assigned-direction: +1 or -1.
-; Velocities start at zero, so everyone starts from rest.
 to initialize-pedestrian [initial-x initial-y target-x target-y assigned-direction]
   set shape "circle"
-  set size 2 * body-radius     ; radius is used for wall contact, not pair forces
+  set size 2 * body-radius
   setxy initial-x initial-y
   set goal-x target-x
   set goal-y target-y
   set travel-direction assigned-direction
   set desired-speed sample-desired-speed
-  ; Orange walks right, blue walks left (scenarios may recolour).
   set color ifelse-value (travel-direction = 1) [orange + 1] [blue]
   set reached-goal? false
   set returned? false
   set waypoints []
   set stop-x false
+  set stop-y false
   set birth-seconds elapsed-seconds
   set started? false
   set slow-seconds 0
@@ -212,223 +114,115 @@ to initialize-pedestrian [initial-x initial-y target-x target-y assigned-directi
   set previous-y ycor
   set step-end-x xcor
   set step-end-y ycor
+  set avm-ties []
+  set avm-neighbor-rows []
   set pen-size 1
   pen-up
-  ; Sample once at creation, then retain the same force direction across wraps.
-  let noise-angle random-float 360
-  set noise-unit-x cos noise-angle
-  set noise-unit-y sin noise-angle
   update-desired-direction
-  ; NetLogo headings use atan dx dy (x first), measured clockwise from north.
-  set heading atan ex ey
-  ; Actual and preferred velocities initially equal zero.
+  set move-ex ex
+  set move-ey ey
+  if vector-length move-ex move-ey = 0 [set move-ex assigned-direction]
+  set heading atan move-ex move-ey
+  ; Start at rest; Eq. (10) sets the speed at the first update.
 end
 
-; Draw one desired speed v_i^0 from a Gaussian with the slider mean and SD.
 to-report sample-desired-speed
   if mean-desired-speed <= 0 or desired-speed-sd < 0
-    [error "Mean desired speed must be positive and its standard deviation nonnegative."]
-  ; A Gaussian has an unphysical negative tail; resample nonpositive draws.
-  ; At the defaults (1.34 +/- 0.26 m/s), rejection is extremely rare.
+    [error "Mean desired speed must be positive; its SD must be nonnegative."]
   let sampled-speed random-normal mean-desired-speed desired-speed-sd
-  while [sampled-speed <= 0] [
-    set sampled-speed random-normal mean-desired-speed desired-speed-sd
-  ]
+  while [sampled-speed <= 0] [set sampled-speed random-normal mean-desired-speed desired-speed-sd]
   report sampled-speed
 end
 
-; Equation (1).
-; e_i = (target - x_i) / |target - x_i|, where the target is the first
-; unvisited waypoint, or the goal when no waypoints remain.
 to update-desired-direction
-  if active-periodic? [
-    ; There is no terminal point on a periodic walkway: keep walking along it.
-    set ex travel-direction
-    set ey 0
-    set drive-factor 1
-    stop
-  ]
-  ; Head for the next waypoint (e.g. a door opening), then the goal.
-  ; Drop every waypoint already within waypoint-radius (several can be
-  ; reached in one step if they lie close together).
+  set drive-factor 1
+  if active-periodic? [set ex travel-direction set ey 0 stop]
   while [not empty? waypoints and
-         vector-length (item 0 first waypoints - xcor)
-                       (item 1 first waypoints - ycor) < waypoint-radius]
+    vector-length (item 0 first waypoints - xcor) (item 1 first waypoints - ycor) < waypoint-radius]
     [set waypoints but-first waypoints]
   let target-x goal-x
   let target-y goal-y
-  if not empty? waypoints [
-    set target-x item 0 first waypoints
-    set target-y item 1 first waypoints
-  ]
-  let delta-x target-x - xcor
-  let delta-y target-y - ycor
-  let distance-to-goal vector-length delta-x delta-y
-  ; Standing exactly on the target leaves the direction undefined; use zero
-  ; so the driving term only brakes.
+  if not empty? waypoints [set target-x item 0 first waypoints set target-y item 1 first waypoints]
+  let distance-to-goal vector-length (target-x - xcor) (target-y - ycor)
   ifelse distance-to-goal > epsilon [
-    set ex delta-x / distance-to-goal
-    set ey delta-y / distance-to-goal
-  ] [
-    set ex 0
-    set ey 0
-  ]
-  ; Near stop-x the desired speed becomes gap / (4 tau). For one-dimensional,
-  ; uncapped, unforced motion this gives a critically damped gap equation.
-  ; (With gap g and speed -g', the driving term gives
-  ;  g'' + g'/tau + g/(4 tau^2) = 0, whose characteristic polynomial has the
-  ;  double root -1/(2 tau): the critically damped case.)
-  ; Critical damping alone does not prevent overshoot for every initial
-  ; approach velocity. The separate stop-line boundary below enforces the
-  ; red-light constraint; this factor supplies smooth approach braking.
-  ; e stays a unit vector, so the field-of-view weighting of Eq. (5) is unchanged.
-  set drive-factor 1
-  if is-number? stop-x and ex != 0 [
-    ; gap is the signed distance still to walk to the stop line along the
-    ; direction of travel (negative once past it).
-    let gap (stop-x - xcor) * (ifelse-value (ex > 0) [1] [-1])
-    ; Clamp to [-1, 1]: far from the line the pedestrian walks normally; a
-    ; pedestrian past the line is driven back at most at full desired speed.
-    set drive-factor max (list -1 (min (list 1 (gap / (4 * tau * desired-speed)))))
-  ]
+    set ex (target-x - xcor) / distance-to-goal
+    set ey (target-y - ycor) / distance-to-goal
+  ] [set ex 0 set ey 0]
 end
 
-; Equations (2), (4), (5), (6).
-; Writes the total acceleration a_i of the preferred velocity into ax, ay.
-to calculate-acceleration
-  ; Equation (2): relax towards the desired velocity v0 * e within tau.
-  ; drive-factor is exactly 1 unless a stop line is active (x * 1 = x exactly).
-  set ax (desired-speed * drive-factor * ex - vx) / tau
-  set ay (desired-speed * drive-factor * ey - vy) / tau
-
-  ; Pair repulsion from every other pedestrian, in a fixed (sorted) order so
-  ; floating-point sums are reproducible.
-  foreach sort other pedestrians [other-person ->
-    let force pair-force other-person
-    let fx item 0 force
-    let fy item 1 force
-    let magnitude vector-length fx fy
-    let weight rear-weight
-    ; Equation (5) uses MINUS the force in its dot product.
-    ; -f points from i towards j, so this tests whether j lies within the
-    ; view half-angle phi around the walking direction e_i. People in view get
-    ; the full force; people behind get rear-weight (c = 0.5) of it.
-    if ex * (- fx) + ey * (- fy) >= magnitude * cos view-half-angle
-      [set weight 1]
-    set ax ax + weight * fx
-    set ay ay + weight * fy
-  ]
-
-  ; Equation (4): walls are always perceived (no direction weighting).
-  foreach wall-segments [wall ->
-    let force wall-force wall
-    set ax ax + item 0 force
-    set ay ay + item 1 force
-  ]
-  ; Equation (6): constant random force while noise-strength is held fixed.
-  ; Strength is acceleration (m/s^2), not a displacement applied each tick.
-  set ax ax + noise-strength * noise-unit-x
-  set ay ay + noise-strength * noise-unit-y
+to-report avm-snapshot
+  report map [p -> [(list who xcor ycor vx vy move-ex move-ey ex ey desired-speed)] of p] sort pedestrians
 end
 
-; Elliptical negative gradient, with a selectable prediction displacement.
-; Reports [fx fy], the repulsive force on the calling pedestrian i from
-; other-person j. q is the vector from j to i; s is how far j is expected to
-; move within the anticipation time T. The equipotential lines of the
-; potential are ellipses with foci at j's current and predicted positions.
-to-report pair-force [other-person]
-  let qx xcor - [xcor] of other-person
-  if active-periodic? [set qx periodic-delta-x qx]   ; nearest periodic image
-  let qy ycor - [ycor] of other-person
-  let sx 0
-  let sy 0
-  ifelse active-relative-anticipation? [
-    ; Relative-velocity anticipation (elliptical specification II, Eq. 12,
-    ; Johansson, Helbing & Shukla). Both velocities are actual time-t vectors.
-    ; q = x_i - x_j, so the predicted relative displacement is q - T(v_j-v_i).
-    set sx anticipation-time * ([vx] of other-person - vx)
-    set sy anticipation-time * ([vy] of other-person - vy)
-  ] [
-    ; Original 1995/report formulation: speed magnitude times desired direction.
-    let other-speed vector-length ([vx] of other-person) ([vy] of other-person)
-    set sx other-speed * anticipation-time * [ex] of other-person
-    set sy other-speed * anticipation-time * [ey] of other-person
-  ]
-  report elliptical-force qx qy sx sy
+; One fixed Euler interval. No pedestrian-distance acceptance test, retry,
+; position projection, or collision-triggered timestep change is applied.
+; TrafficLight may split an outer tick only at a scheduled light event.
+to ped-step
+  ped-check-parameters
+  let step-size dt
+  let start-time elapsed-seconds
+  let people sort pedestrians
+  foreach people [p -> ask p [update-desired-direction]]
+  let states avm-snapshot
+  ; Assign the paper's aligned-pair side choices before calculating agents.
+  ; Canonical order keeps the result independent of actor evaluation order.
+  (foreach people states [[p row] ->
+    let visible-rows avm-unoccluded-neighbors row states
+    let choices map [identity -> (list identity (ifelse-value (random 2 = 0) [-1] [1]))]
+      (avm-tie-neighbors row visible-rows)
+    ask p [set avm-ties choices set avm-neighbor-rows visible-rows]
+  ])
+  let calculation-order ifelse-value avm-reverse-calculation? [reverse people] [people]
+  foreach calculation-order [p -> ask p [
+    let row item (position self people) states
+    let direction avm-steering row avm-neighbor-rows step-size avm-ties
+    let wall-direction avm-wall-heading xcor ycor (item 0 direction) (item 1 direction)
+    let magnitude vector-length (item 0 wall-direction) (item 1 wall-direction)
+    let speed 0
+    ifelse magnitude > 0 [
+      set next-move-ex item 0 wall-direction
+      set next-move-ey item 1 wall-direction
+      set speed avm-speed row avm-neighbor-rows next-move-ex next-move-ey
+      set speed avm-boundary-speed xcor ycor next-move-ex next-move-ey speed step-size stop-x travel-direction
+      ; The crossing controller uses the same existing stop-line rule on y.
+      ; This limits admission at a gate, not pedestrian-pair separation.
+      if is-number? stop-y [
+        set speed avm-axis-stop-speed ycor next-move-ey speed step-size stop-y travel-direction
+      ]
+    ] [set next-move-ex item 0 direction set next-move-ey item 1 direction]
+    if ex = 0 and ey = 0 [set speed 0]
+    set next-vx next-move-ex * speed
+    set next-vy next-move-ey * speed
+    set next-wx next-vx
+    set next-wy next-vy
+    set previous-x xcor
+    set previous-y ycor
+    set next-wrap-count 0
+    set next-x xcor + step-size * next-vx
+    set next-y ycor + step-size * next-vy
+    set step-end-x next-x
+    set step-end-y next-y
+  ]]
+  set last-step-start-seconds start-time
+  set last-step-duration step-size
+  set last-step-paths map [p -> [(list who previous-x previous-y step-end-x step-end-y)] of p] people
+  let endpoints map [p -> [(list who step-end-x step-end-y next-vx next-vy next-move-ex next-move-ey desired-speed)] of p] people
+  set last-internal-step-paths lput (list start-time step-size last-step-paths endpoints) last-internal-step-paths
+  ; Commit even if the paper's motion produces body overlap. Diagnostics
+  ; measure that result; they must not censor or repair this experiment.
+  foreach people [p -> ask p [
+    set ax (next-vx - vx) / step-size
+    set ay (next-vy - vy) / step-size
+    finalize-next-state
+  ]]
+  foreach people [p -> ask p [commit-next-state]]
+  set elapsed-seconds start-time + step-size
+  set avm-accepted-steps avm-accepted-steps + 1 ; committed intervals, legacy name
+  set avm-last-min-step step-size
+  ; avm-rejected-steps remains zero: no rejection branch exists.
+  tick
 end
 
-; Negative gradient -grad_q V(b) of the potential V(b) = V0 exp(-b / sigma),
-; where b is the semi-minor axis of the ellipse through q with foci 0 and s:
-;   2b = sqrt((|q| + |q - s|)^2 - |s|^2).
-; Differentiating gives
-;   F = (V0 / sigma) exp(-b / sigma) * (|q| + |q - s|) / (4b)
-;       * (q / |q| + (q - s) / |q - s|).
-; For s = 0 this reduces to a circular potential: F = (V0/sigma) e^(-|q|/sigma) q/|q|.
-to-report elliptical-force [qx qy sx sy]
-  ; r = q - s: vector from j's predicted position to i.
-  let rx qx - sx
-  let ry qy - sy
-  ; Softened lengths prevent division by zero at the ellipse's foci.
-  ; Away from singularities the change is negligible (epsilon = 1e-6 m).
-  let r1 sqrt (qx * qx + qy * qy + epsilon * epsilon)
-  let r2 sqrt (rx * rx + ry * ry + epsilon * epsilon)
-  let total-distance r1 + r2
-  ; Semi-minor axis b, kept at least epsilon so the 1/b factor stays finite
-  ; when i lies on the segment between the foci (b = 0).
-  let b 0.5 * sqrt (max (list (4 * epsilon * epsilon)
-    (total-distance * total-distance - sx * sx - sy * sy)))
-  let scale (potential-strength / sigma) * exp (- b / sigma)
-    * total-distance / (4 * b)
-  report (list (scale * (qx / r1 + rx / r2))
-               (scale * (qy / r1 + ry / r2)))
-end
-
-; Equation (4), for the nearest point on a finite wall segment.
-; Force = wall-strength * exp(-d / wall-range), pointing from the nearest
-; wall point towards the pedestrian's centre.
-to-report wall-force [wall]
-  let nearest nearest-point-on-segment xcor ycor wall
-  let delta-x xcor - item 0 nearest
-  let delta-y ycor - item 1 nearest
-  let d vector-length delta-x delta-y
-  ; The outward direction is undefined exactly on a zero-thickness wall.
-  if d < epsilon [error "Pedestrian is exactly on a wall. Check its position or reduce dt."]
-  let strength wall-strength * exp (- d / wall-range)
-  report (list (strength * delta-x / d) (strength * delta-y / d))
-end
-
-; Equations (7), (8), (9). Write buffers, not the current state.
-to calculate-next-state
-  ; Single-pedestrian API used by the mathematical/boundary unit tests.
-  ; Production steps use the joint contact pass between these two procedures.
-  propose-next-state
-  finalize-next-state
-end
-
-; Candidate motion for this step, ignoring other pedestrians' hard bodies
-; (the pair constraint is applied later, jointly, in contact.nls).
-to propose-next-state
-  ; Also capture these when a diagnostic calls this procedure directly.
-  set previous-x xcor
-  set previous-y ycor
-  set next-wrap-count 0
-  ; Equation (7): integrate the preferred velocity with the acceleration.
-  set next-wx wx + dt * ax
-  set next-wy wy + dt * ay
-  ; Equation (8): actual velocity is the capped preferred velocity.
-  set-next-velocity-from-preferred
-  ; Equation (9): move with the NEW velocity (semi-implicit Euler).
-  set next-x xcor + dt * next-vx
-  set next-y ycor + dt * next-vy
-  ; Hard walls and stop lines may shorten or redirect this move.
-  apply-wall-contact
-  ; Unwrapped endpoint, the starting point for the pair-contact solver.
-  set step-end-x next-x
-  set step-end-y next-y
-end
-
-; Runs once per pedestrian, after all contact-corrected endpoints are known.
-; Exit hooks can record arrivals, so they must never see a rejected proposal.
 to finalize-next-state
   if active-periodic? [
     ; Count how many periods the move crossed, then wrap x into [0, hall-length).
@@ -451,299 +245,6 @@ to finalize-next-state
   scenario-exit-check
 end
 
-; Equation (8): v = w * min(1, v_max / |w|) with v_max = 1.3 * desired-speed.
-; The direction of v always equals the direction of w; only the length is cut.
-to set-next-velocity-from-preferred
-  ; The paper's actual velocity must always be the capped preferred velocity.
-  let preferred-speed vector-length next-wx next-wy
-  let speed-factor 1
-  if preferred-speed > 0 [
-    set speed-factor min (list 1 (1.3 * desired-speed / preferred-speed))
-  ]
-  set next-vx next-wx * speed-factor
-  set next-vy next-wy * speed-factor
-end
-
-; Hard boundaries supplement the soft social forces. Wall segments are capsules
-; with radius body-radius. Detect the first swept contact, including end posts,
-; then resolve all active supporting planes together. Rechecking the whole path
-; prevents a later corner correction from violating an earlier wall.
-; A single horizontal face keeps the original hallway's normal clamp and
-; full-step tangential update, including reapplying the unchanged speed cap.
-;
-; Constraints are kept as "planes" [nx ny c], meaning the half-plane
-; nx * x + ny * y >= c (in 2D a half-plane bounded by a line). Each detected
-; contact adds one plane. The loop:
-;   1. remove the inward component of the preferred velocity w for every
-;      plane, and recap v = cap(w);
-;   2. move the position by the tangential part of the velocity change and
-;      project it onto the allowed region (clamping the normal motion);
-;   3. sweep the new path against all walls; if it still enters a capsule,
-;      add that plane and repeat.
-to apply-wall-contact
-  ; Unconstrained proposal; each pass restarts from it, so corrections never
-  ; accumulate in an order-dependent way.
-  let raw-wx next-wx
-  let raw-wy next-wy
-  let raw-vx next-vx
-  let raw-vy next-vy
-  let raw-x next-x
-  let raw-y next-y
-  let planes []
-  ; A red stop line is an explicit scenario boundary, not an extra social force.
-  ; The allowed side is behind the line: normal-x points against travel.
-  if is-number? stop-x [
-    let normal-x (- travel-direction)
-    if normal-x * next-x < normal-x * stop-x - 1e-10
-      [set planes (list (list normal-x 0 (normal-x * stop-x)))]
-  ]
-  let finished? false
-  let attempts 0
-  while [not finished?] [
-    if not empty? planes [
-      ; For velocities the same normals apply with c = 0: n . w >= 0 forbids
-      ; any velocity component into a wall.
-      let velocity-planes map [plane -> (list (item 0 plane) (item 1 plane) 0)] planes
-      let projected project-to-planes raw-wx raw-wy velocity-planes
-      set next-wx item 0 projected
-      set next-wy item 1 projected
-      set-next-velocity-from-preferred
-      ; Keep the attempted normal displacement until it is clamped to contact;
-      ; use the newly capped tangential velocity for the whole step, as before.
-      let tangent-x next-vx - raw-vx
-      let tangent-y next-vy - raw-vy
-      let first-plane first planes
-      let nx item 0 first-plane
-      let ny item 1 first-plane
-      ; Remove the normal part of the velocity change: only its tangential
-      ; part (sliding along the wall) adjusts the raw position.
-      let normal-change tangent-x * nx + tangent-y * ny
-      set tangent-x tangent-x - normal-change * nx
-      set tangent-y tangent-y - normal-change * ny
-      ; Two non-parallel planes (a corner): there is no single tangent
-      ; direction, so rely purely on the position projection below.
-      if not empty? filter [plane -> abs (nx * item 1 plane - ny * item 0 plane) > 1e-10] planes [
-        set tangent-x 0
-        set tangent-y 0
-      ]
-      let projected-position project-to-planes (raw-x + dt * tangent-x) (raw-y + dt * tangent-y) planes
-      set next-x item 0 projected-position
-      set next-y item 1 projected-position
-    ]
-    ; Find the earliest wall contact along the (possibly corrected) path.
-    let contact false
-    foreach wall-segments [wall ->
-      let candidate swept-wall-contact xcor ycor next-x next-y wall
-      if candidate != false [
-        ifelse contact = false
-          [set contact candidate]
-          [if item 0 candidate < item 0 contact [set contact candidate]]
-      ]
-    ]
-    ifelse contact = false
-      [set finished? true]
-      [
-        ; contact is [time-fraction nx ny c]; keep the plane [nx ny c].
-        set planes lput (but-first contact) planes
-        set attempts attempts + 1
-        ; Each support plane excludes a whole convex wall capsule. If numerical
-        ; degeneracy prevents progress, fail visibly instead of crossing a wall.
-        if attempts > 4 * length wall-segments + 16
-          [error "Could not resolve wall constraints. Review geometry and initial clearance."]
-      ]
-  ]
-end
-
-; Euclidean projection onto an intersection of half-planes nx*x + ny*y >= c.
-; In 2D the closest feasible point is the input, a line projection, or the
-; intersection of two boundary lines. This avoids order-dependent corrections.
-; All candidates are enumerated and the nearest feasible one is reported.
-to-report project-to-planes [px py planes]
-  if inside-planes? px py planes [report (list px py)]
-  let best false
-  let best-distance 1e100
-  ; Candidate type 1: orthogonal projection onto each boundary line.
-  foreach planes [plane ->
-    let nx item 0 plane
-    let ny item 1 plane
-    let shift item 2 plane - nx * px - ny * py
-    let cx px + shift * nx
-    let cy py + shift * ny
-    if inside-planes? cx cy planes [
-      let distance-squared (cx - px) ^ 2 + (cy - py) ^ 2
-      if distance-squared < best-distance [
-        set best (list cx cy)
-        set best-distance distance-squared
-      ]
-    ]
-  ]
-  ; Candidate type 2: intersection of two boundary lines (Cramer's rule).
-  foreach range length planes [i ->
-    foreach (range (i + 1) (length planes)) [j ->
-      let a item i planes
-      let b item j planes
-      let determinant (item 0 a * item 1 b) - (item 1 a * item 0 b)
-      if abs determinant > 1e-12 [   ; skip (near-)parallel lines
-        let cx ((item 2 a * item 1 b) - (item 1 a * item 2 b)) / determinant
-        let cy ((item 0 a * item 2 b) - (item 2 a * item 0 b)) / determinant
-        if inside-planes? cx cy planes [
-          let distance-squared (cx - px) ^ 2 + (cy - py) ^ 2
-          if distance-squared < best-distance [
-            set best (list cx cy)
-            set best-distance distance-squared
-          ]
-        ]
-      ]
-    ]
-  ]
-  if best = false [error "Incompatible wall or stop-line constraints. Review initial placement and geometry."]
-  report best
-end
-
-; True when (px, py) satisfies every half-plane, with 1e-10 m of slack.
-to-report inside-planes? [px py planes]
-  report empty? filter [plane -> item 0 plane * px + item 1 plane * py < item 2 plane - 1e-10] planes
-end
-
-; Return [time-fraction nx ny c] for the first entry into a wall's body-radius
-; capsule, or false. Periodic full-width horizontal walls have no end posts.
-; time-fraction is in [0, 1) along the move; [nx ny c] is the supporting
-; half-plane at the contact point.
-to-report swept-wall-contact [from-x from-y to-x to-y wall]
-  let x1 item 0 wall
-  let y1 item 1 wall
-  let x2 item 2 wall
-  let y2 item 3 wall
-  ; Periodic hallway wall spanning the whole period: treat it as an infinite
-  ; horizontal line, so the seam never creates a false end post.
-  if active-periodic? and y1 = y2 and abs (x2 - x1) >= hall-length - epsilon [
-    let side ifelse-value (from-y >= y1) [1] [-1]   ; +1 above the wall, -1 below
-    let limit side * y1 + body-radius
-    if side * to-y >= limit - 1e-10 [report false]  ; endpoint still clear
-    let fraction 0
-    if side * from-y > limit [set fraction (limit - side * from-y) / (side * (to-y - from-y))]
-    report (list fraction 0 side limit)
-  ]
-  if not active-periodic? [report swept-capsule-contact from-x from-y to-x to-y wall]
-  ; Other walls on a periodic walkway: test every periodic copy of the wall
-  ; that the (unwrapped) path could reach, and keep the earliest contact.
-  let best false
-  let first-image (floor (min (list from-x to-x) / hall-length)) - 1
-  let last-image (floor (max (list from-x to-x) / hall-length)) + 1
-  foreach (range first-image (last-image + 1)) [k ->
-    let shift k * hall-length
-    let shifted-wall (list (x1 + shift) y1 (x2 + shift) y2)
-    let candidate swept-capsule-contact from-x from-y to-x to-y shifted-wall
-    if candidate != false [
-      ifelse best = false [set best candidate]
-        [if item 0 candidate < item 0 best [set best candidate]]
-    ]
-  ]
-  report best
-end
-
-; First contact of a moving point with a capsule (all points within
-; body-radius of a segment). A capsule is two flat faces plus two round end
-; caps; test the faces directly and the caps with swept-circle-contact.
-to-report swept-capsule-contact [from-x from-y to-x to-y wall]
-  let x1 item 0 wall
-  let y1 item 1 wall
-  let x2 item 2 wall
-  let y2 item 3 wall
-  let move-x to-x - from-x
-  let move-y to-y - from-y
-  let seg-x x2 - x1
-  let seg-y y2 - y1
-  let length-squared seg-x * seg-x + seg-y * seg-y
-  ; Already inside the capsule at the start (should not happen in a valid
-  ; state): report an immediate contact pushing straight outwards.
-  let nearest nearest-point-on-segment from-x from-y wall
-  let start-nx from-x - item 0 nearest
-  let start-ny from-y - item 1 nearest
-  let start-distance vector-length start-nx start-ny
-  if start-distance < body-radius - 1e-10 [
-    if start-distance < epsilon [error "Pedestrian starts on a wall. Review initial placement."]
-    set start-nx start-nx / start-distance
-    set start-ny start-ny / start-distance
-    report (list 0 start-nx start-ny (start-nx * item 0 nearest + start-ny * item 1 nearest + body-radius))
-  ]
-  let best false
-  ; Flat faces (skipped for zero-length segments, which are pure posts).
-  if length-squared > 0 [
-    let seg-length sqrt length-squared
-    ; Unit normal of the segment; each side is tried with its own sign.
-    let nx (- seg-y) / seg-length
-    let ny seg-x / seg-length
-    foreach [-1 1] [side ->
-      let normal-x side * nx
-      let normal-y side * ny
-      ; The face lies body-radius out from the segment along this normal.
-      let limit normal-x * x1 + normal-y * y1 + body-radius
-      let before normal-x * from-x + normal-y * from-y
-      let change normal-x * move-x + normal-y * move-y
-      ; Must start outside this face and move towards it.
-      if before >= limit - 1e-10 and change < -1e-12 [
-        let fraction (limit - before) / change
-        if fraction >= -1e-10 and fraction < 1 - 1e-10 [
-          set fraction max (list 0 fraction)
-          let hit-x from-x + fraction * move-x
-          let hit-y from-y + fraction * move-y
-          ; Only count it if the hit is alongside the segment (not beyond
-          ; its ends; those are handled by the round caps).
-          let along ((hit-x - x1) * seg-x + (hit-y - y1) * seg-y) / length-squared
-          if along >= 0 and along <= 1 [
-            let candidate (list fraction normal-x normal-y limit)
-            ifelse best = false [set best candidate]
-              [if fraction < item 0 best [set best candidate]]
-          ]
-        ]
-      ]
-    ]
-  ]
-  ; Round end caps (door posts and wall corners).
-  foreach (list (list x1 y1) (list x2 y2)) [point ->
-    let candidate swept-circle-contact from-x from-y to-x to-y item 0 point item 1 point
-    if candidate != false [
-      ifelse best = false [set best candidate]
-        [if item 0 candidate < item 0 best [set best candidate]]
-    ]
-  ]
-  report best
-end
-
-; First time a point moving from (from-x, from-y) to (to-x, to-y) comes within
-; body-radius of the fixed point (px, py). Solves |q + t m|^2 = r^2 for the
-; smaller root t in [0, 1), where q = start - point and m = the move.
-; Reports [t nx ny c], with n the outward normal at contact and c chosen so
-; that n . x >= c is the line tangent to the circle at the contact point.
-to-report swept-circle-contact [from-x from-y to-x to-y px py]
-  let move-x to-x - from-x
-  let move-y to-y - from-y
-  let quadratic move-x * move-x + move-y * move-y
-  if quadratic = 0 [report false]
-  let qx from-x - px
-  let qy from-y - py
-  let half-linear qx * move-x + qy * move-y
-  let constant qx * qx + qy * qy - body-radius * body-radius
-  let discriminant half-linear * half-linear - quadratic * constant
-  if discriminant <= 0 [report false]        ; the path misses the circle
-  let fraction (- half-linear - sqrt discriminant) / quadratic
-  if fraction < -1e-10 or fraction >= 1 - 1e-10 [report false]
-  set fraction max (list 0 fraction)
-  let nx qx + fraction * move-x
-  let ny qy + fraction * move-y
-  let norm vector-length nx ny
-  if norm = 0 [report false]
-  set nx nx / norm
-  set ny ny / norm
-  ; Moving away from (or tangentially past) the post is not a contact.
-  if nx * move-x + ny * move-y >= -1e-12 [report false]
-  report (list fraction nx ny (nx * px + ny * py + body-radius))
-end
-
-; Copy the buffered next-* values into the pedestrian's state, or remove it
-; if it arrived or was pushed back out. Runs after every pedestrian has its
-; final, contact-corrected buffers.
 to commit-next-state
   if reached-goal? [
     set arrived-count arrived-count + 1
@@ -756,6 +257,8 @@ to commit-next-state
     set returned-count returned-count + 1
     die
   ]
+  set move-ex next-move-ex
+  set move-ey next-move-ey
   set wx next-wx
   set wy next-wy
   set vx next-vx
@@ -774,8 +277,6 @@ to commit-next-state
   ; Face the direction of motion; keep the old heading when (nearly) still.
   if vector-length vx vy > epsilon [set heading atan vx vy]
 end
-
-; ---------------------------------------------------------------- geometry helpers
 
 to-report periodic-delta-x [delta-x]
   ; Minimum-image displacement, using the same period as position wrapping.

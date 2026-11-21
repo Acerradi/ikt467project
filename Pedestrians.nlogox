@@ -6,8 +6,8 @@
 ; Hallway scenario: open arrivals or a fixed population with periodic ends.
 ; The shared pedestrian model lives in core/pedestrians.nls.
 ; Interface variables: spawn-rate, dt, mean-desired-speed, desired-speed-sd,
-; noise-strength, simulation-seed, show-trails?, periodic?, population,
-; relative-anticipation?, hall-width, run-checks?.
+; simulation-seed, show-trails?, periodic?, population,
+; hall-width, run-checks?.
 ;
 ; Two modes, chosen by the periodic? switch at setup:
 ;   open      pedestrians arrive at random at either end (Poisson process,
@@ -15,14 +15,14 @@
 ;             opposite end and are removed when they cross its exit plane.
 ;   periodic  a fixed population of `population` pedestrians, half walking
 ;             each way; the left and right ends are joined, so whoever walks
-;             out on one side re-enters on the other. Used for the lane
-;             formation experiment (Figure 3 of Helbing & Molnar), where the
-;             density must stay constant.
+;             out on one side re-enters on the other. Used for the
+;             hallway comparison geometry; density stays constant. The AVM
+;             equations do not reproduce the original 1995 force model.
 ;
 ; Geometry (metres): a 50 m long hallway, hall-width wide, with walls at
 ; y = hall-bottom (1.5) and y = hall-top. Exit planes at x = 1 and x = 49.
 
-__includes [ "core/pedestrians.nls" "core/contact.nls" "core/checks.nls" "core/stats.nls" ]
+__includes [ "core/pedestrians.nls" "core/avm.nls" "core/boundaries.nls" "core/checks.nls" "core/stats.nls" ]
 
 ; Build the hallway, reset all modules and (periodic mode) place the population.
 to setup
@@ -67,6 +67,7 @@ end
 ; One integration step of length dt: spawn arrivals (open mode), move
 ; everyone, then update the optional correctness checks.
 to go
+  checks-begin-step
   ped-check-parameters
   if spawn-rate < 0 [error "spawn-rate must not be negative."]
 
@@ -172,7 +173,7 @@ end
     <button x="170" y="10" width="75" height="40" display="step" kind="Observer" forever="false" disableUntilTicks="true">go</button>
     <slider x="10" y="65" width="235" height="50" display="spawn-rate" variable="spawn-rate" min="0" max="5" step="0.1" default="1" direction="Horizontal" units="attempts/s" />
     <slider x="10" y="125" width="235" height="50" display="dt" variable="dt" min="0.005" max="0.1" step="0.005" default="0.02" direction="Horizontal" units="s" />
-    <slider x="10" y="185" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.02" default="1.34" direction="Horizontal" units="m/s" />
+    <slider x="10" y="185" width="235" height="50" display="mean-desired-speed" variable="mean-desired-speed" min="0.2" max="2.0" step="0.01" default="1.55" direction="Horizontal" units="m/s" />
     <monitor x="10" y="410" width="115" height="55" display="simulated seconds" precision="2" fontSize="11">elapsed-seconds</monitor>
     <monitor x="130" y="410" width="115" height="55" display="mean speed (m/s)" precision="3" fontSize="11">average-speed</monitor>
     <monitor x="10" y="475" width="115" height="55" display="walking" precision="0" fontSize="11">count pedestrians</monitor>
@@ -182,7 +183,7 @@ Select periodic? and population, then click setup.
 Periodic: fixed population, wrapping ends, no new arrivals.
 Open: random entries and destinations, controlled by spawn-rate.
 The top and bottom walls stay solid in both modes.</note>
-    <slider x="10" y="250" width="235" height="50" display="noise-strength" variable="noise-strength" min="0" max="0.2" step="0.005" default="0" direction="Horizontal" units="m/s^2" />
+    <monitor x="10" y="250" width="235" height="50" display="body radius (m)" precision="2" fontSize="11">body-radius</monitor>
     <slider x="10" y="310" width="235" height="50" display="simulation-seed" variable="simulation-seed" min="0" max="1000" step="1" default="42" direction="Horizontal" units="setup" />
     <switch x="10" y="365" height="35" width="235" on="false" variable="show-trails?" display="show-trails?" />
     <monitor x="10" y="540" width="115" height="55" display="spawned" precision="0" fontSize="11">spawned-count</monitor>
@@ -193,15 +194,15 @@ The top and bottom walls stay solid in both modes.</note>
     <monitor x="275" y="270" width="130" height="55" display="active mode" precision="0" fontSize="11">ifelse-value (active-periodic? = true) ["periodic"] ["open"]</monitor>
     <monitor x="410" y="430" width="125" height="55" display="seam crossings" precision="0" fontSize="11">wrap-count</monitor>
     <monitor x="545" y="430" width="160" height="55" display="density (people/m^2)" precision="3" fontSize="11">pedestrian-density</monitor>
-    <slider x="875" y="270" width="230" height="50" variable="desired-speed-sd" display="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.26" direction="Horizontal" units="m/s" />
+    <slider x="875" y="270" width="230" height="50" variable="desired-speed-sd" display="desired-speed-sd" min="0" max="0.8" step="0.01" default="0.18" direction="Horizontal" units="m/s" />
     <monitor x="715" y="430" width="170" height="55" display="mean desired (m/s)" precision="3" fontSize="11">average-desired-speed</monitor>
     <monitor x="895" y="430" width="170" height="55" display="desired SD (m/s)" precision="3" fontSize="11">desired-speed-spread</monitor>
-    <switch x="275" y="495" width="240" height="40" on="true" variable="relative-anticipation?" display="relative-anticipation?" />
-    <monitor x="530" y="495" width="180" height="55" display="active prediction" precision="0" fontSize="11">ifelse-value (active-relative-anticipation? = true) ["relative velocity"] ["original 1995"]</monitor>
-    <note x="725" y="495" width="380" height="80" fontSize="12" markdown="false" textColorLight="-16777216" textColorDark="-1" backgroundLight="0" backgroundDark="0">ANTICIPATION (applies on setup)
-On: relative actual velocity (default).
-Off: original 1995 desired-direction prediction.
-Other force parameters are unchanged.</note>
+    <monitor x="275" y="495" width="240" height="40" display="anticipation (s)" precision="2" fontSize="11">anticipation-time</monitor>
+    <monitor x="530" y="495" width="180" height="55" display="time gap (s)" precision="2" fontSize="11">avm-time-gap</monitor>
+    <note x="725" y="495" width="380" height="80" fontSize="12" markdown="false" textColorLight="-16777216" textColorDark="-1" backgroundLight="0" backgroundDark="0">AVM 2021
+Anticipated positions determine direction.
+Available headway determines speed.
+Radius 0.20 m; no pair position correction.</note>
     <slider x="10" y="605" width="235" height="50" display="hall-width" variable="hall-width" min="2" max="30" step="1" default="10" direction="Horizontal" units="m" />
     <switch x="10" y="665" width="235" height="40" on="false" variable="run-checks?" display="run-checks?" />
     <monitor x="275" y="600" width="125" height="55" display="lanes" precision="0" fontSize="11">lane-count</monitor>
@@ -233,262 +234,104 @@ Other force parameters are unchanged.</note>
         <update>if stats-sample? [plotxy elapsed-seconds lane-count]</update>
       </pen>
     </plot>
+    <monitor x="275" y="880" width="190" height="55" display="integration segments" precision="0" fontSize="11">length last-internal-step-paths</monitor>
+    <monitor x="475" y="880" width="190" height="55" display="shortest segment (s)" precision="8" fontSize="11">ifelse-value (empty? last-internal-step-paths) [0] [min map [entry -&gt; item 1 entry] last-internal-step-paths]</monitor>
+    <monitor x="275" y="950" width="190" height="55" display="repulsion k" precision="3" fontSize="11">avm-strength</monitor>
+    <monitor x="475" y="950" width="190" height="55" display="range D (m)" precision="3" fontSize="11">avm-range</monitor>
+    <monitor x="675" y="950" width="190" height="55" display="time gap T (s)" precision="3" fontSize="11">avm-time-gap</monitor>
+    <monitor x="875" y="950" width="190" height="55" display="turning tau (s)" precision="3" fontSize="11">tau</monitor>
   </widgets>
-  <info><![CDATA[## START HERE
+  <info><![CDATA[## PEDESTRIANS
 
-Choose periodic? and click setup, then go. Boundary mode, population and relative-anticipation? changes
-take effect on setup. The active mode monitor shows the mode actually running.
-Click go again to pause, or step to advance one integration step.
+A 50 m hallway supports either a fixed periodic population or random arrivals at its open ends. The default 150 people in a 50 by 10 m hallway give density 0.3 people/m^2. Periodic walkers retain their travel direction; open arrivals receive a random destination at the opposite exit. No lanes or preferred passing side are prescribed. This is the project hallway comparison geometry, not a reproduction of the 1995 force-model experiment.
 
-RELATIVE ANTICIPATION (default)
+## ANTICIPATION VELOCITY MODEL (AVM)
 
-relative-anticipation? is on by default. The pair potential now predicts the
-relative actual motion of both pedestrians: s_ij = T * (v_j - v_i). It uses
-both x and y velocity components. This is the elliptical-specification-II
-prediction from Johansson, Helbing & Shukla, Eq. (12):
-https://arxiv.org/html/0810.4587#S3.SS3.SSS1
+This model uses Xu, Chraibi and Seyfried (2021), Eqs. (1)-(10).
+Pedestrians choose a direction using anticipated neighbour positions, then
+select speed from available headway along that direction:
 
-This changes one prediction term; it is not a reproduction of the complete
-later model or its calibrated parameters. The exponential potential, analytic
-gradient, perception weights, preferred/actual velocity distinction, wall
-forces, 2 s horizon and other parameter values are retained.
+    speed = min(free-speed, max(0, headway / time-gap))
 
-Turn relative-anticipation? off and click setup to compare the original 1995
-prediction s_j = T * |v_j| * e_j. The active prediction monitor shows the
-formula actually running. Changing the switch during a run takes effect only
-on the next setup, so comparisons use a consistent force law. Setup with the
-same seed produces identical initial positions, speeds and directions in
-both modes. Both also use a separate hard constraint keeping centres at least
-0.5 m apart throughout each step. This geometric rule supplements the paper's
-soft forces; their formulas and parameters are unchanged.
+There is no social-force acceleration sum and no stored preferred-velocity
+accumulator. The old 1.3-times-desired-speed cap does not apply: the individual
+free speed itself is the maximum. Each pedestrian samples free speed once,
+using mean 1.55 m/s and standard deviation 0.18 m/s by default. Nonpositive
+Gaussian draws are resampled, as in the project initialization.
 
-PERIODIC MODE (default)
+The Table 3 bidirectional parameter set is used in every scenario:
+repulsion strength k = 6, interaction range D = 0.01 m, time-gap T = 0.6 s,
+turning time tau = 0.3 s, anticipation time = 0.75 s. Radius r = 0.20 m is
+the requested change from the paper's 0.18 m. Thus touching bodies have
+a centre distance of 0.4 m. Actual separation is measured, not enforced by
+a separate pair constraint. The same radius is used for drawing, pair
+headway, wall clearance, door posts and traffic-light stop placement.
 
-setup places population pedestrians at uniform random positions throughout the
-hallway, with half assigned to walk right (orange) and half left (blue). The
-even-valued population slider defaults to 150. Initial centres are at least 0.6 m
-apart, including across the periodic seam. No lanes or passing side are assigned.
-All pedestrians start at rest.
+There is no pedestrian-pair position projection, hidden overlap correction,
+or additional pair repulsion. Pair spacing follows the AVM equations and
+the fixed timestep; overlap diagnostics remain observational.
+The paper chooses a random side for an exactly aligned predicted neighbour;
+this is distinct from the former continuous random-force control.
 
-The hallway length is 50 m. Crossing x=50 wraps to x=0; crossing x=0 to the
-left wraps to the right end. Overshoot is preserved by modulo arithmetic.
-Pedestrians retain y, actual/preferred velocities, noise direction, identity
-and walking direction across a wrap. A wrap does not create or delete anyone.
-The population stays fixed; spawn-rate is ignored. The seam crossings counter
-counts crossings in either direction, including backwards crossings.
+## WALLS AND SCENARIO BOUNDARIES
 
-Periodic pedestrians have a fixed longitudinal desired direction, [1 0] or
-[-1 0], rather than a terminal random point. This lets them continue indefinitely
-without steering diagonally back to a fixed y or turning around at the seam.
-The goal fields retain initial metadata but are not steering targets in this
-mode. Pair forces and placement clearance use the nearest periodic x-image,
-with a 50 m period. Merely wrapping the coordinates would not be sufficient.
+The preprint does not specify a wall law. This implementation adds documented
+wall gliding inspired by the authors' JuPedSim implementation: within radius
+plus a 0.1 m buffer, an inward heading component is removed and a 0.3 outward
+component is added before normalization. Wall steering runs BEFORE the final
+pedestrian headway speed calculation so its direction is consistent with it.
+This ordering is our integration choice, not an exact JuPedSim reproduction.
 
-Density uses the physical wall-to-wall area 50 * 10 = 500 m^2. The default
-population of 150 therefore gives exactly 0.3 people/m^2. The top/bottom walls stay solid. NetLogo's built-in wrapping
-is disabled: custom wrapping uses exactly 50 m, not the 51-patch view width.
-Trails are lifted for seam crossings to avoid drawing a line across the view.
+Wall segments and their round end caps use the pedestrian radius. A swept
+geometric bound can only reduce speed along the selected heading; it does
+not redirect velocity after pair-speed selection or reposition a pedestrian.
+A red stop line uses gap/T and a swept advance bound. No reverse speed or
+random creeping is added. Existing geometry, spawning, destinations and
+routing are scenario choices, not claims of reproducing the paper's entire
+experiment. The crossing remains uncontrolled.
 
-This mode is motivated by Section IV of Helbing & Molnar:
-https://arxiv.org/html/cond-mat/9805244#S4
-Periodic ends reduce entry disturbances; stable lane formation is an outcome
-to investigate, not an imposed arrangement or a guaranteed result. The paper's
-illustrated simulations omit fluctuations, so noise-strength now defaults to
-0. The optional random force remains available through that slider.
+## NUMERICS AND CHECKS
 
-OPEN MODE
+Click setup, then go; click go again to pause. Step advances one interval of
+length dt. Heading uses normalized forward Euler, and every pedestrian uses
+the same old-state snapshot before all new states are committed. The physical
+time-gap, anticipation time and turning time are separate parameters.
 
-Turn periodic? off and click setup. The hallway starts empty. Arrivals are
-sampled from Poisson(spawn-rate * dt), where spawn-rate is the TOTAL attempted
-arrivals per simulated second, shared by both ends. New pedestrians start at
-x=1 or x=49 with equal probability. Their initial y and opposite-end destination
-y are sampled independently and uniformly from 2.25 to 10.75 m. Each destination
-stays fixed. A chosen entrance gets up to 20 placement attempts for 0.6 m initial
-clearance. Blocked arrivals are skipped and counted.
+There is no added pedestrian-distance limit: no pair position projection,
+overlap-based rejection, automatic timestep halving, distance-dependent step
+cap or minimum-separation abort. A step is committed even if it produces
+overlapping bodies. The experiment measures whether AVM's own direction and
+speed equations maintain separation at the chosen dt. The body diameter of
+0.4 m remains in the paper's headway formula; it is not an extra acceptance
+condition. Smaller fixed timesteps can be compared to measure discretization
+sensitivity without imposing a distance threshold.
 
-Open-mode pedestrians leave when they reach a 0.3 m destination disk or cross
-the opposite exit plane. Those pushed back out of the entrance are counted as
-returned, not successful arrivals. Set spawn-rate = 0 to let this mode empty.
-Counts satisfy spawned = walking + arrived + returned. Dense open-mode runs
-can retain pedestrians interacting near different exit targets even after
-arrivals stop; check the walking count rather than assuming the hallway clears.
-An earlier 30-by-9 m regression retained two agents after 300 s without
-arrivals; that historical result is not a measurement of this larger geometry.
-In periodic mode spawned = walking = initial population, with no arrivals or returns.
+The traffic-light scenario alone can split an outer interval at its scheduled
+light event. Recorded paths include every resulting segment, periodic seams
+and pedestrians removed at exits. Door passages are collected chronologically.
 
-SHARED CONTROLS
+With run-checks? on, separation and overlap diagnostics only observe the
+generated motion; they never change it or stop a run because people overlap.
+check-invariants still validates finite states, wall clearance and the
+individual free-speed bound. The existing wall and red-stop boundary rules
+remain scenario additions, separate from the pedestrian-pair equations.
 
-Start with dt = 0.02 s, mean-desired-speed = 1.34 m/s,
-desired-speed-sd = 0.26 m/s, noise-strength = 0 and simulation-seed = 42.
-Each pedestrian samples their own desired-speed ONCE at creation from a normal
-distribution with that mean and standard deviation. Nonpositive draws are
-resampled; at the defaults this affects an extremely small Gaussian tail.
-The positive desired speed stays fixed for that pedestrian, including across
-periodic wraps. Both the driving force and speed cap use this individual value.
-The mean/SD monitors show the actual finite population, which need not equal
-the distribution's configured mean/SD exactly. Set desired-speed-sd = 0 for
-identical speeds. Parameter changes affect newly created pedestrians; use setup
-to resample a periodic population. The seed controls all randomized initialization and,
-in open mode, later arrivals. Repeating setup with the same controls reproduces
-the same run. Different dt values need not produce matching open-mode arrival
-samples, although the expected rate per simulated second stays the same.
+Previous results from the version that rejected overlapping steps do not
+establish collision avoidance by AVM alone. See AVM.md for the current
+unconstrained-pair test protocol and results. Scenario plots and CSV logging
+retain their existing sampling cadence.
 
-The random-force direction is assigned once per pedestrian and kept across
-wraps. It is not fresh jitter each tick. Set noise-strength = 0 to disable it.
-dt, noise-strength, show-trails? and open-mode spawn-rate can change during
-a run. Speed-distribution controls affect future births without changing
-existing pedestrians. periodic?, relative-anticipation?, population and
-simulation-seed require setup.
-setup clears previous trails and samples a fresh periodic population.
+## SOURCES
 
-## UNITS AND TIME
+Xu, Chraibi and Seyfried (2021), Anticipation in a velocity-based model for
+pedestrian dynamics, especially Eqs. (1)-(10) and Table 3:
+https://arxiv.org/pdf/2107.00624
 
-One coordinate unit (one patch width) is one metre. Pedestrians use continuous
-xcor/ycor positions, not patch-to-patch jumps. All forces act as accelerations.
-One tick is one numerical step; elapsed-seconds accumulates dt. Neither depends
-on the computer's wall clock. T = anticipation-time is separate from dt.
+Author project explanation distinguishing JuPedSim wall handling:
+https://pedestriandynamics.org/models/anticipation_velocity_model/
 
-## EQUATION TO PROCEDURE MAP
-
-1: update-desired-direction computes [ex ey] towards a point in open mode.
-In periodic mode it uses the assigned longitudinal direction [1 0] or [-1 0].
-2: calculate-acceleration starts with (desired-speed * e - v) / tau, using
-the individual pedestrian's sampled desired speed.
-3: pair-force constructs q_ij and the selected prediction displacement;
-elliptical-force evaluates -grad V. The default relative displacement is
-T * (v_j - v_i); original mode uses T * |v_j| * e_j.
-Periodic mode uses the minimum-image x displacement before this calculation.
-4: wall-force finds the nearest point on each finite wall segment.
-5: calculate-acceleration weights each pedestrian force using e dot (-f).
-6: calculate-acceleration sums the driving, pedestrian, wall and random-force terms.
-7: calculate-next-state integrates preferred velocity [wx wy].
-8: calculate-next-state limits actual velocity [vx vy] to 1.3 * desired-speed.
-9: calculate-next-state advances position with the NEW actual velocity.
-apply-wall-contact adds a solid-wall boundary condition after the free
-step: centres stay at least 0.2 m from the top/bottom walls. Motion into a wall
-is removed from preferred velocity while retaining its tangential component.
-Actual velocity is then recalculated from the speed cap and the along-wall
-position is updated with that consistent velocity.
-
-For Eq. 3, let r1 = ||q||, r2 = ||q-s|| and R = r1+r2. Differentiating
-with s held fixed gives:
-
-    grad b = R / (4*b) * (q/r1 + (q-s)/r2)
-    f = (V0/sigma) * exp(-b/sigma) * grad b
-
-The code uses sqrt(length-squared + epsilon-squared) for r1 and r2 and
-a roundoff floor for b. This smooths the undefined foci with epsilon = 1e-6 m.
-At exact coincident positions a smoothed pair force can be zero. Pedestrian
-pair interactions are softened point interactions, not hard-body collisions.
-Initial positions are separated. The independent joint contact pass supplies
-the hard 0.5 m pair clearance after this soft-force calculation.
-
-## UPDATE ORDER
-
-In open mode, go first creates this step's random arrivals. Both modes then
-update all desired directions, calculate all accelerations, propose all next
-states, resolve contacts jointly, then finalize exits and commit all next
-states. New arrivals are included in every pass. No
-pedestrian sees a neighbour's updated position or velocity during force
-calculation. wx/wy stay separate from vx/vy for ordinary free motion. A contact
-correction sets w consistently with its corrected v; otherwise both are
-retained. The loops use sorted agent lists. setup seeds the generator once;
-open-mode go samples arrivals and each new pedestrian's attributes, while
-existing pedestrians retain their assigned attributes. Periodic go creates no
-new agents and does not resample their directions or force biases.
-
-## PARAMETERS
-
-The interface exposes periodic?, relative-anticipation?, population, spawn-rate,
-dt, mean-desired-speed,
-desired-speed-sd, noise-strength, simulation-seed and show-trails?. noise-strength is the magnitude of f_i^r
-in m/s^2. A uniform
-angle from 0 to 360 degrees gives its direction; this choice is not calibrated
-to data. It remains constant per person while the strength slider is fixed.
-Other parameters are set near the start of setup, in the Code tab:
-
-    tau = 0.5 s
-    anticipation-time (T) = 2 s
-    potential-strength (V0) = 2.1 m^2/s^2
-    sigma = 0.3 m
-    view-half-angle (phi) = 100 degrees
-    rear-weight (c) = 0.5
-    wall-strength (AW) = 50 m/s^2
-    wall-range (BW) = 0.2 m
-
-These interaction values match the original paper's simulation parameters.
-They have not been recalibrated for the relative-velocity extension.
-NetLogo's sin/cos/atan use its degree and heading conventions:
-https://docs.netlogo.org/dict/atan
-
-## GEOMETRY AND LIMITATIONS
-
-The example is a 50 m corridor with walls at y=1.5 and y=11.5. The ends
-are periodic or open according to the mode selected at setup. wall-segments stores each wall as [x1 y1 x2 y2]; change these coordinates
-to change the force geometry. Patch colours only illustrate this corridor;
-changing colours alone does not change the walls. In open mode destinations
-are independently sampled points at the opposite end, x=1 or x=49, with y
-uniformly sampled from 2.25 to 10.75 m. Periodic mode samples initial positions
-throughout the hallway and keeps longitudinal walking directions. Neither
-mode prescribes lanes or a preferred passing side.
-
-Pedestrian repulsion is soft. core/contact.nls separately enforces 0.5 m
-centre clearance along the full step, including periodic seams. This rule
-uses a deterministic joint projection of unsafe motion; it can make people
-wait or jam. It is not a term in the original paper. pair-contact-enabled?
-defaults to true at setup; only disable it for an unconstrained comparison.
-The wall-force formula still uses centre-to-wall distance, without a
-radius offset. In addition, a solid-wall contact rule prevents centres crossing
-y = hall-bottom + body-radius or y = hall-top - body-radius (1.7 and 11.3 m).
-This positional constraint is a hallway boundary condition in addition to the
-report's force equations. It removes outward normal velocity from both actual
-and preferred velocity to avoid continued pressure driving a pedestrian through
-the wall. Tangential preferred velocity is retained, and actual velocity is
-recomputed using its new norm. Wall contact handles general finite segments
-and their endpoints, including simultaneous contacts at corners.
-
-Open ends remove pedestrians at their destination end or on returning out of
-the entrance. Periodic ends instead wrap x into [0,50) and count crossings.
-Neither case sends an invalid coordinate to NetLogo's setxy primitive.
-Compare dt = 0.02 and 0.01 at equal simulated time before trusting quantitative
-results; wall constraints do not make large timesteps equally accurate.
-Desired speeds vary between individuals and remain fixed after creation.
-The 2 s anticipation horizon is independent of the default 0.02 s integrator step.
-
-## SOURCE
-
-Based on equations (1)-(9) from the supplied IKT467 pedestrian report, with
-relative-velocity anticipation enabled by default as described above,
-including the report's once-assigned random force in Eq. (6). The Poisson
-arrival process, uniform start/destination coordinates, entry clearance, force
-direction distribution, force magnitude, arrival rule and numerical
-regularization, solid-wall constraint, open-end exit handling and the periodic
-mode's fixed-population/minimum-image construction are implementation choices.
-
-
-## SHARED MODULES, CHECKS AND LANES
-
-This hallway model is one of four scenario models. The pedestrian model itself
-is in core/pedestrians.nls, the correctness checks in core/checks.nls and the
-statistics, plots and logging in core/stats.nls. The other scenarios are in
-scenarios/ (Door, TrafficLight, Crossing).
-
-hall-width sets the wall-to-wall width (default 10 m, the original hallway).
-Turn run-checks? on to update pass-throughs (pairs that swapped order while
-their centres were within one body radius sideways), the smallest separation
-seen, wall clearance and speed-cap violations every step. It is off by
-default because it slows the simulation.
-
-lanes counts lanes with the project's definition: a pedestrian belongs to a
-lane if its distance to the least-squares line through all lane members is
-less than 1.5 m. Candidate lanes are split where consecutive y positions of
-same-direction pedestrians differ by more than lane-gap = 0.6 m, and groups
-of fewer than 5 are not counted. On the periodic walkway the line is
-horizontal, because x is not continuous across the seam.
-
-The BehaviorSpace experiment figure-3-lanes repeats Figure 3 of Helbing and
-Molnar: density 0.3 per m^2 (population = 15 * hall-width), widths 4 to 20 m,
-three seeds, 60 s, lanes sampled every 10 s.
+The JuPedSim implementation also contains a pair buffer and random creep;
+those additions are not adopted in this paper-based implementation.
 ]]></info>
   <turtleShapes>
     <shape name="default" rotatable="false" editableColorIndex="0">
@@ -518,12 +361,6 @@ setup</setup>
         <metric>stat-mean lateral-speeds</metric>
       </metrics>
       <constants>
-        <enumeratedValueSet variable="relative-anticipation?">
-          <value value="true"></value>
-        </enumeratedValueSet>
-        <enumeratedValueSet variable="noise-strength">
-          <value value="0"></value>
-        </enumeratedValueSet>
         <enumeratedValueSet variable="dt">
           <value value="0.02"></value>
         </enumeratedValueSet>
